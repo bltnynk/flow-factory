@@ -39,6 +39,7 @@ from ..samples import BaseSample
 from ..rewards import BaseRewardModel, RewardBuffer
 from ..utils.base import filter_kwargs, create_generator_by_prompt, to_broadcast_tensor
 from ..utils.noise_schedule import TimeSampler, flow_match_sigma
+from ..utils.score_dynamics import maybe_compute_spatial_weight, spatial_weighted_mean
 from ..utils.logger_utils import setup_logger
 from ..utils.dist import reduce_loss_info
 
@@ -218,28 +219,36 @@ class AWMTrainer(BaseTrainer):
         timestep: torch.Tensor,
         weighting: Literal['Uniform', 't', 't**2', 'huber', 'ghuber'] = 'Uniform',
         ghuber_power: float = 0.25,
+        spatial_weight: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Compute weighted log probability (matching loss) for AWM.
-        
+
         Args:
             model_output: Model's velocity prediction, shape varies by model.
             target: Target velocity = noise - clean_latents, same shape as model_output.
             timestep: Scheduler-scale timesteps (B,) in ``[0, 1000]``; weighting uses ``σ = t/1000``.
             weighting: Weighting scheme for the loss.
             ghuber_power: Power parameter for generalized huber loss.
-        
+            spatial_weight: Optional per-position weight (spatial-aware advantage shaping)
+                broadcastable against the per-pixel matching loss and normalized to
+                spatial-mean 1. When provided, replaces the uniform spatial mean with a
+                weighted mean so good/bad regions are reweighted (see ``score_dynamics``).
+
         Returns:
             Weighted log probability tensor of shape (B,).
         """
         model_output = model_output.double()
         target = target.double()
-        
+
         # Matching loss (negative MSE as log prob)
         # Mean over all dimensions except batch (dim 0)
         log_prob = -(model_output - target) ** 2
-        log_prob = log_prob.mean(dim=tuple(range(1, log_prob.ndim)))  # Dynamic: works for any shape
-        
+        if spatial_weight is not None:
+            log_prob = spatial_weighted_mean(log_prob, spatial_weight.to(log_prob.dtype))
+        else:
+            log_prob = log_prob.mean(dim=tuple(range(1, log_prob.ndim)))  # Dynamic: works for any shape
+
         t = flow_match_sigma(timestep.view(-1))
         
         if weighting == 'Uniform':
@@ -267,17 +276,20 @@ class AWMTrainer(BaseTrainer):
         noised_latents: torch.Tensor,
         clean_latents: torch.Tensor,
         random_noise: torch.Tensor,
+        spatial_weight: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         Compute AWM forward pass for a single timestep.
-        
+
         Args:
             batch: Batch containing prompt embeddings and other inputs.
             timestep: Timestep tensor of shape (B,) in scheduler scale ``[0, 1000]``.
             noised_latents: Interpolated latents ``x_t = (1-σ) x_1 + σ noise`` with ``σ = t/1000``.
             clean_latents: Clean latents x_1 (final denoised).
             random_noise: Sampled noise.
-        
+            spatial_weight: Optional per-position weight for spatial-aware advantage shaping,
+                forwarded to ``compute_weighted_log_prob``.
+
         Returns:
             Dictionary with:
                 - log_prob: (B,)
@@ -310,6 +322,7 @@ class AWMTrainer(BaseTrainer):
             timestep=timestep,
             weighting=self.weighting,
             ghuber_power=self.ghuber_power,
+            spatial_weight=spatial_weight,
         )
                 
         return {
@@ -367,6 +380,11 @@ class AWMTrainer(BaseTrainer):
                 batch_size = batch['all_latents'].shape[0]
                 clean_latents = batch['all_latents'][:, -1]
 
+                # Spatial-aware advantage shaping weight (fixed per sample; the same
+                # weight must be used for old and current log-probs so the PPO ratio
+                # stays consistent). None when the feature is off.
+                spatial_weight = maybe_compute_spatial_weight(self.training_args, batch)
+
                 # ---------- Per-batch precompute: old log-probs under sampling policy ----------
                 self.adapter.rollout()
                 with torch.no_grad(), self.autocast(), self.sampling_context():
@@ -385,7 +403,8 @@ class AWMTrainer(BaseTrainer):
                         noised_latents = (1 - sigma_broadcast) * clean_latents + sigma_broadcast * noise
 
                         old_output = self._compute_awm_output(
-                            batch, t_flat, noised_latents, clean_latents, noise
+                            batch, t_flat, noised_latents, clean_latents, noise,
+                            spatial_weight=spatial_weight,
                         )
                         old_log_probs_list.append(old_output['log_prob'].detach())
 
@@ -417,9 +436,10 @@ class AWMTrainer(BaseTrainer):
                             
                             # 2. Forward pass for current policy
                             current_output = self._compute_awm_output(
-                                batch, t_flat, noised_latents, clean_latents, noise
+                                batch, t_flat, noised_latents, clean_latents, noise,
+                                spatial_weight=spatial_weight,
                             )
-                            
+
                             log_prob = current_output['log_prob']  # (B,)
                             
                             # 3. Compute PPO-style clipped loss

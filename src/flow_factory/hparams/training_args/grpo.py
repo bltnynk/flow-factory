@@ -16,9 +16,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Any, Literal, Tuple
 
-from ._base import TrainingArguments, _standardize_clip_range
+from ._base import TrainingArguments, _standardize_clip_range, _standardize_spatial_shaping
 
 
 @dataclass
@@ -56,6 +56,47 @@ class GRPOTrainingArguments(TrainingArguments):
         metadata={"help": "Device to store reference model parameters."},
     )
 
+    # --- Spatial-aware advantage shaping (score dynamics; arXiv:2503.16218) ---
+    spatial_advantage_shaping: bool = field(
+        default=False,
+        metadata={"help": (
+            "Enable spatial-aware advantage shaping: derive a per-pixel artifact map from "
+            "flow-matching score dynamics during rollout and use it to redistribute the scalar "
+            "per-sample advantage across space during optimization. Off by default (byte-identical to baseline)."
+        )},
+    )
+    spatial_shaping_mode: Literal['sign_aware', 'favor_clean'] = field(
+        default='sign_aware',
+        metadata={"help": (
+            "How the artifact map reshapes the loss. 'sign_aware': reinforce clean regions of "
+            "positive-advantage samples and concentrate the penalty on artifact regions of "
+            "negative-advantage samples. 'favor_clean': always upweight clean regions."
+        )},
+    )
+    spatial_shaping_strength: float = field(
+        default=1.0,
+        metadata={"help": "Modulation strength gamma (>= 0). 0 recovers uniform spatial weighting."},
+    )
+    spatial_shaping_weight_clip: Tuple[float, float] = field(
+        default=(0.1, 3.0),
+        metadata={"help": "(min, max) clamp on the per-pixel weight before spatial-mean-1 renormalization."},
+    )
+    artifact_sigma_window: Tuple[float, float] = field(
+        default=(0.2, 0.8),
+        metadata={"help": (
+            "Noise-level sigma window over which score dynamics are accumulated (sigma runs 1->0; "
+            "a mid window targets the artifact-revealing 'mutation' phase)."
+        )},
+    )
+    artifact_smooth_sigma: float = field(
+        default=0.0,
+        metadata={"help": "Gaussian-blur sigma (latent pixels) for the artifact map; 0 disables. Unpacked 2D latents only."},
+    )
+    artifact_temperature: float = field(
+        default=1.0,
+        metadata={"help": "Sigmoid temperature for robust normalization of the artifact map; larger is softer."},
+    )
+
     def __post_init__(self):
         super().__post_init__()
         # Guard kl_beta against scientific-notation strings (e.g. "1e-3" from CLI overrides).
@@ -64,6 +105,20 @@ class GRPOTrainingArguments(TrainingArguments):
         self.adv_clip_range = _standardize_clip_range(self.adv_clip_range, 'adv_clip_range')
         if self.kl_type not in ['v-based', 'x-based']:
             raise ValueError(f"Invalid KL type: {self.kl_type}. Valid options are: ['v-based', 'x-based'].")
+        (
+            self.spatial_shaping_mode,
+            self.spatial_shaping_strength,
+            self.spatial_shaping_weight_clip,
+            self.artifact_sigma_window,
+            self.artifact_temperature,
+        ) = _standardize_spatial_shaping(
+            self.spatial_shaping_mode,
+            self.spatial_shaping_strength,
+            self.spatial_shaping_weight_clip,
+            self.artifact_sigma_window,
+            self.artifact_temperature,
+        )
+        self.artifact_smooth_sigma = float(self.artifact_smooth_sigma)
 
     def get_num_train_timesteps(self, args: Any) -> int:
         return args.scheduler_args.num_sde_steps

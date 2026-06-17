@@ -86,6 +86,16 @@ class BaseSample:
     latent_index_map: Optional[torch.Tensor] = None   # (T+1,) LongTensor
     log_probs : Optional[torch.Tensor] = None # (num_steps,)
     log_prob_index_map: Optional[torch.Tensor] = None  # (T+1,) LongTensor
+    # Spatial-aware advantage shaping (score dynamics). None unless enabled; see
+    # `utils/score_dynamics.py`. Per-position artifact intensity in [0, 1] with the
+    # channel dim collapsed to a singleton so it broadcasts over the per-pixel loss:
+    # (1, H, W) for unpacked latents, (seq, 1) for packed latents.
+    artifact_map: Optional[torch.Tensor] = None
+    # Per-pixel (pre-mean) SDE log-prob at the `log_probs` positions, used by GRPO /
+    # GRPO-Guard to compute the spatially-weighted ratio consistently between rollout
+    # and optimization. Shares `log_prob_index_map`. (num_steps, C, H, W) or
+    # (num_steps, seq, C).
+    log_probs_unreduced: Optional[torch.Tensor] = None
     # Output dimensions
     height : Optional[int] = None
     width : Optional[int] = None

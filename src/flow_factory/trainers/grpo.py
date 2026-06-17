@@ -32,6 +32,7 @@ from ..samples import BaseSample
 from ..utils.base import filter_kwargs, create_generator_by_prompt
 from ..utils.logger_utils import setup_logger
 from ..utils.trajectory_collector import TrajectoryCollector, compute_trajectory_indices
+from ..utils.score_dynamics import maybe_compute_spatial_weight, spatial_weighted_mean
 from ..utils.dist import reduce_loss_info
 
 logger = setup_logger(__name__)
@@ -144,6 +145,11 @@ class GRPOTrainer(BaseTrainer):
                     batch = BaseSample.stack(batch_samples)
                     latents_index_map = batch['latent_index_map']  # (T+1,) LongTensor
                     log_probs_index_map = batch['log_prob_index_map']  # (T,) LongTensor
+                    # Spatial-aware advantage shaping weight (fixed per sample). None when off.
+                    # When active, the SDE log-prob is reduced with this weight in BOTH the
+                    # rollout-stored old log-prob and the current one, so the ratio stays
+                    # consistent (== 1 on-policy).
+                    spatial_weight = maybe_compute_spatial_weight(self.training_args, batch)
                     # Iterate through timesteps
                     for idx, timestep_index in enumerate(tqdm(
                         self.adapter.scheduler.train_timesteps,
@@ -187,7 +193,9 @@ class GRPOTrainer(BaseTrainer):
                                     return_kwargs = ['log_prob', 'next_latents', 'next_latents_mean', 'dt']
                             else:
                                 return_kwargs = ['log_prob', 'dt']
-                            
+                            if spatial_weight is not None:
+                                return_kwargs.append('log_prob_unreduced')
+
                             forward_inputs['return_kwargs'] = return_kwargs
                             output = self.adapter.forward(**forward_inputs)
 
@@ -196,8 +204,15 @@ class GRPOTrainer(BaseTrainer):
                             adv = batch['advantage']
                             adv_clip_range = self.training_args.adv_clip_range
                             adv = torch.clamp(adv, adv_clip_range[0], adv_clip_range[1])
-                            # PPO-style clipped loss
-                            ratio = torch.exp(output.log_prob - old_log_prob)
+                            # PPO-style clipped loss. With spatial shaping, reduce the per-pixel
+                            # SDE log-prob with the spatial weight (same weight for old/new).
+                            if spatial_weight is not None:
+                                old_log_prob_unreduced = batch['log_probs_unreduced'][:, log_probs_index_map[timestep_index]]
+                                cur_log_prob = spatial_weighted_mean(output.log_prob_unreduced, spatial_weight)
+                                old_log_prob_w = spatial_weighted_mean(old_log_prob_unreduced, spatial_weight)
+                                ratio = torch.exp(cur_log_prob - old_log_prob_w)
+                            else:
+                                ratio = torch.exp(output.log_prob - old_log_prob)
                             ratio_clip_range = self.training_args.clip_range
 
                             unclipped_loss = -adv * ratio
@@ -373,6 +388,8 @@ class GRPOGuardTrainer(GRPOTrainer):
                     latents_index_map = batch['latent_index_map']  # (T+1,) LongTensor
                     log_probs_index_map = batch['log_prob_index_map']  # (T,) LongTensor
                     callback_index_map = batch['callback_index_map'][0]  # (T,) LongTensor, shared across batch.
+                    # Spatial-aware advantage shaping weight (fixed per sample). None when off.
+                    spatial_weight = maybe_compute_spatial_weight(self.training_args, batch)
                     # Iterate through timesteps
                     for idx, timestep_index in enumerate(tqdm(
                         self.adapter.scheduler.train_timesteps,
@@ -415,7 +432,9 @@ class GRPOGuardTrainer(GRPOTrainer):
                                     return_kwargs.add('noise_pred')
                                 elif self.training_args.kl_type == 'x-based':
                                     return_kwargs.add('next_latents_mean')
-                            
+                            if spatial_weight is not None:
+                                return_kwargs.add('log_prob_unreduced')
+
                             forward_inputs['return_kwargs'] = list(return_kwargs)
                             output = self.adapter.forward(**forward_inputs)
 
@@ -427,8 +446,23 @@ class GRPOGuardTrainer(GRPOTrainer):
                             # Reweighted ratio
                             scale_factor = torch.sqrt(-output.dt) * output.std_dev_t
                             old_next_latents_mean = batch['next_latents_mean'][:, callback_index_map[timestep_index]]
-                            mse = (output.next_latents_mean - old_next_latents_mean).flatten(1).pow(2).mean(dim=1)
-                            ratio = torch.exp((output.log_prob - old_log_prob) * scale_factor + mse / (2 * scale_factor))
+                            # Spatial-aware advantage shaping: reduce the log-prob difference and
+                            # the next-latents-mean MSE with the per-position weight (same weight
+                            # for old/new keeps the ratio consistent). Both stay shape (B,), so the
+                            # reweighted-ratio expression below is unchanged.
+                            if spatial_weight is not None:
+                                old_log_prob_unreduced = batch['log_probs_unreduced'][:, log_probs_index_map[timestep_index]]
+                                log_prob_diff = (
+                                    spatial_weighted_mean(output.log_prob_unreduced, spatial_weight)
+                                    - spatial_weighted_mean(old_log_prob_unreduced, spatial_weight)
+                                )
+                                mse = spatial_weighted_mean(
+                                    (output.next_latents_mean - old_next_latents_mean) ** 2, spatial_weight
+                                )
+                            else:
+                                log_prob_diff = output.log_prob - old_log_prob
+                                mse = (output.next_latents_mean - old_next_latents_mean).flatten(1).pow(2).mean(dim=1)
+                            ratio = torch.exp(log_prob_diff * scale_factor + mse / (2 * scale_factor))
                             # PPO-style clipped loss
                             ratio_clip_range = self.training_args.clip_range
 

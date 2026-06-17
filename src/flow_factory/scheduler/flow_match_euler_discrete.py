@@ -363,12 +363,12 @@ class FlowMatchEulerDiscreteSDEScheduler(FlowMatchEulerDiscreteScheduler, SDESch
 
             if compute_log_prob:
                 std_variance = (std_dev_t * torch.sqrt(-1 * dt))
-                log_prob = (
+                log_prob_unreduced = (
                     -((next_latents.detach() - next_latents_mean) ** 2) / (2 * std_variance ** 2)
                     - torch.log(std_variance)
                     - torch.log(torch.sqrt(2 * torch.as_tensor(math.pi)))
                 )
-                log_prob = log_prob.mean(dim=tuple(range(1, log_prob.ndim)))
+                log_prob = log_prob_unreduced.mean(dim=tuple(range(1, log_prob_unreduced.ndim)))
 
         elif dynamics_type == "Dance-SDE":
             pred_original_sample = latents - sigma * noise_pred
@@ -388,14 +388,14 @@ class FlowMatchEulerDiscreteSDEScheduler(FlowMatchEulerDiscreteScheduler, SDESch
 
             if compute_log_prob:
                 std_variance = (std_dev_t * torch.sqrt(-1 * dt))
-                log_prob = (
+                log_prob_unreduced = (
                     (-((next_latents.detach() - next_latents_mean) ** 2) / (2 * std_variance ** 2))
                     - torch.log(std_variance)
                     - torch.log(torch.sqrt(2 * torch.as_tensor(math.pi)))
                 )
 
                 # mean along all but batch dimension
-                log_prob = log_prob.mean(dim=tuple(range(1, log_prob.ndim)))
+                log_prob = log_prob_unreduced.mean(dim=tuple(range(1, log_prob_unreduced.ndim)))
 
         elif dynamics_type == "CPS":
             # FlowCPS
@@ -416,8 +416,8 @@ class FlowMatchEulerDiscreteSDEScheduler(FlowMatchEulerDiscreteScheduler, SDESch
                 next_latents = next_latents.to(_input_dtype).float()
 
             if compute_log_prob:
-                log_prob = -((next_latents.detach() - next_latents_mean) ** 2)
-                log_prob = log_prob.mean(dim=tuple(range(1, log_prob.ndim)))
+                log_prob_unreduced = -((next_latents.detach() - next_latents_mean) ** 2)
+                log_prob = log_prob_unreduced.mean(dim=tuple(range(1, log_prob_unreduced.ndim)))
 
 
         if not compute_log_prob:

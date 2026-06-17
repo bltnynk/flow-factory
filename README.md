@@ -98,6 +98,10 @@ See [`Algorithm Guidance`](guidance/algorithms.md) for more information.
 
 > Model and algorithm are fully decoupled in Flow-Factory, enabling all listed model–algorithm combinations to work out of the box. The configurations under `examples/` have been verified to yield measurable performance gains. For unlisted combinations, find the closest (task, algorithm) config and swap in the desired model or algorithm parameters.
 
+### Spatial-aware advantage shaping (optional)
+
+GRPO, GRPO-Guard, AWM, and DiffusionNFT support an optional **spatial-aware advantage shaping** add-on that derives a per-pixel artifact map from flow-matching *score dynamics* ([ASCED](https://arxiv.org/abs/2503.16218)) during rollout and uses it to redistribute the per-sample advantage across space during optimization — reinforcing clean regions and concentrating the penalty on artifact/hallucination regions. Enable with `spatial_advantage_shaping: true` (off by default; see `examples/grpo/lora/sd3_5/spatial_shaping.yaml`, `examples/awm/lora/sd3_5/spatial_shaping.yaml`). Wired for SD3.5 and Flux.1.
+
 # 💾 Hardware Requirements
 
 # 🚀 Get Started

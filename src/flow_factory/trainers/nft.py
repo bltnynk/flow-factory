@@ -38,6 +38,7 @@ from ..rewards import RewardBuffer
 from ..utils.base import filter_kwargs, create_generator_by_prompt, to_broadcast_tensor
 from ..utils.logger_utils import setup_logger
 from ..utils.noise_schedule import TimeSampler, flow_match_sigma
+from ..utils.score_dynamics import maybe_compute_spatial_weight, spatial_weighted_mean
 from ..utils.dist import reduce_loss_info
 
 logger = setup_logger(__name__)
@@ -283,6 +284,9 @@ class DiffusionNFTTrainer(BaseTrainer):
                 batch_size = batch['all_latents'].shape[0]
                 clean_latents = batch['all_latents'][:, -1]
 
+                # Spatial-aware advantage shaping weight (fixed per sample). None when off.
+                spatial_weight = maybe_compute_spatial_weight(self.training_args, batch)
+
                 # ---------- Per-batch precompute: old v predictions under sampling policy ----------
                 self.adapter.rollout()
                 with torch.no_grad(), self.autocast(), self.sampling_context():
@@ -343,15 +347,25 @@ class DiffusionNFTTrainer(BaseTrainer):
                                 weight = torch.abs(x0_pred.double() - clean_latents.double()).mean(
                                     dim=tuple(range(1, clean_latents.ndim)), keepdim=True
                                 ).clip(min=1e-5)
-                            positive_loss = ((x0_pred - clean_latents) ** 2 / weight).mean(dim=tuple(range(1, clean_latents.ndim)))
-                            
+                            positive_se = (x0_pred - clean_latents) ** 2 / weight
                             # Negative loss
                             neg_x0_pred = noised_latents - sigma_broadcast * negative_pred
                             with torch.no_grad():
                                 neg_weight = torch.abs(neg_x0_pred.double() - clean_latents.double()).mean(
                                     dim=tuple(range(1, clean_latents.ndim)), keepdim=True
                                 ).clip(min=1e-5)
-                            negative_loss = ((neg_x0_pred - clean_latents) ** 2 / neg_weight).mean(dim=tuple(range(1, clean_latents.ndim)))
+                            negative_se = (neg_x0_pred - clean_latents) ** 2 / neg_weight
+
+                            # Spatial-aware advantage shaping: weight the per-pixel matching
+                            # error (upweight clean regions / downweight artifacts) before the
+                            # spatial reduction; falls back to the uniform mean when disabled.
+                            if spatial_weight is not None:
+                                positive_loss = spatial_weighted_mean(positive_se, spatial_weight)
+                                negative_loss = spatial_weighted_mean(negative_se, spatial_weight)
+                            else:
+                                reduce_dims = tuple(range(1, clean_latents.ndim))
+                                positive_loss = positive_se.mean(dim=reduce_dims)
+                                negative_loss = negative_se.mean(dim=reduce_dims)
                             
                             # Combined loss
                             ori_policy_loss = (r.squeeze() * positive_loss + (1.0 - r.squeeze()) * negative_loss) / self.nft_beta

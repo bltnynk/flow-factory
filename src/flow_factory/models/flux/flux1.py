@@ -38,12 +38,14 @@ from ...scheduler import (
 )
 from ...utils.base import filter_kwargs
 from ...utils.trajectory_collector import (
-    TrajectoryCollector, 
+    TrajectoryCollector,
     CallbackCollector,
-    TrajectoryIndicesType, 
+    TrajectoryIndicesType,
     create_trajectory_collector,
     create_callback_collector,
 )
+from ...utils.score_dynamics import ScoreDynamicsTracker
+from ...utils.noise_schedule import flow_match_sigma
 from ...utils.logger_utils import setup_logger
 
 logger = setup_logger(__name__)
@@ -168,6 +170,11 @@ class Flux1Adapter(BaseAdapter):
         compute_log_prob: bool = True,
         extra_call_back_kwargs: List[str] = [],
         trajectory_indices: TrajectoryIndicesType = 'all',
+        # Spatial-aware advantage shaping (score dynamics)
+        spatial_advantage_shaping: bool = False,
+        artifact_sigma_window: Tuple[float, float] = (0.2, 0.8),
+        artifact_smooth_sigma: float = 0.0,
+        artifact_temperature: float = 1.0,
     ) -> List[Flux1Sample]:
         """Execute generation and return FluxSample objects."""
         
@@ -214,11 +221,25 @@ class Flux1Adapter(BaseAdapter):
         if compute_log_prob:
             log_prob_collector = create_trajectory_collector(trajectory_indices, num_inference_steps)
         callback_collector = create_callback_collector(trajectory_indices, num_inference_steps)
-        
+        # Spatial-aware advantage shaping: accumulate score dynamics online and (for
+        # log-prob-based algorithms) collect the per-pixel SDE log-prob. FLUX latents are
+        # packed (B, seq, C), so the artifact map is per-token (channel_dim=-1) and 2D
+        # smoothing does not apply.
+        score_dynamics_tracker = (
+            ScoreDynamicsTracker(artifact_sigma_window) if spatial_advantage_shaping else None
+        )
+        log_prob_unreduced_collector = (
+            create_trajectory_collector(trajectory_indices, num_inference_steps)
+            if spatial_advantage_shaping and compute_log_prob
+            else None
+        )
+
         for i, t in enumerate(timesteps):
             current_noise_level = self.scheduler.get_noise_level_for_timestep(t)
             t_next = timesteps[i + 1] if i + 1 < len(timesteps) else torch.tensor(0, device=device)
             return_kwargs = list(set(['next_latents', 'log_prob', 'noise_pred'] + extra_call_back_kwargs))
+            if log_prob_unreduced_collector is not None:
+                return_kwargs.append('log_prob_unreduced')
             current_compute_log_prob = compute_log_prob and current_noise_level > 0
 
             output = self.forward(
@@ -234,11 +255,17 @@ class Flux1Adapter(BaseAdapter):
                 return_kwargs=return_kwargs,
                 noise_level=current_noise_level,
             )
-            
+
+            if score_dynamics_tracker is not None:
+                # x̂₀ = latents - σ·v uses the current (pre-step) latents and velocity.
+                score_dynamics_tracker.update(latents, output.noise_pred, float(flow_match_sigma(t)))
+
             latents = self.cast_latents(output.next_latents, default_dtype=dtype)
             latent_collector.collect(latents, i + 1)
             if current_compute_log_prob:
                 log_prob_collector.collect(output.log_prob, i)
+                if log_prob_unreduced_collector is not None:
+                    log_prob_unreduced_collector.collect(output.log_prob_unreduced, i)
 
             callback_collector.collect_step(
                 step_idx=i,
@@ -247,10 +274,10 @@ class Flux1Adapter(BaseAdapter):
                 capturable={'noise_level': current_noise_level},
             )
 
-        
+
         # 6. Decode images
         images = self.decode_latents(latents, height, width, output_type='pt')
-        
+
         # 7. Create samples
         extra_call_back_res = callback_collector.get_result()          # (B, len(trajectory_indices), ...)
         callback_index_map = callback_collector.get_index_map()        # (T,) LongTensor
@@ -258,6 +285,19 @@ class Flux1Adapter(BaseAdapter):
         latent_index_map = latent_collector.get_index_map()            # (T+1,) LongTensor
         all_log_probs = log_prob_collector.get_result() if compute_log_prob else None
         log_prob_index_map = log_prob_collector.get_index_map() if compute_log_prob else None
+        # Score-dynamics artifact map (B, seq, 1) and per-pixel log-probs, or None when disabled.
+        artifact_map = (
+            score_dynamics_tracker.finalize(
+                channel_dim=-1,
+                temperature=artifact_temperature,
+                smooth_sigma=artifact_smooth_sigma,
+            )
+            if score_dynamics_tracker is not None
+            else None
+        )
+        all_log_probs_unreduced = (
+            log_prob_unreduced_collector.get_result() if log_prob_unreduced_collector is not None else None
+        )
         samples = [
             Flux1Sample(
                 # Denoising trajectory
@@ -266,6 +306,13 @@ class Flux1Adapter(BaseAdapter):
                 log_probs=torch.stack([lp[b] for lp in all_log_probs], dim=0) if all_log_probs is not None else None,
                 latent_index_map=latent_index_map,
                 log_prob_index_map=log_prob_index_map,
+                # Spatial-aware advantage shaping
+                artifact_map=artifact_map[b] if artifact_map is not None else None,
+                log_probs_unreduced=(
+                    torch.stack([lp[b] for lp in all_log_probs_unreduced], dim=0)
+                    if all_log_probs_unreduced is not None
+                    else None
+                ),
                 # Prompt
                 prompt=prompt[b] if isinstance(prompt, list) else prompt,
                 prompt_ids=prompt_ids[b] if prompt_ids is not None else None,

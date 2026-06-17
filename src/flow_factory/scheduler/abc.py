@@ -29,6 +29,9 @@ class SDESchedulerOutput(BaseOutput):
     std_dev_t: Optional[torch.FloatTensor] = None
     dt: Optional[torch.FloatTensor] = None
     log_prob: Optional[torch.FloatTensor] = None
+    # Per-pixel (pre-mean) SDE log-prob, requested via return_kwargs=['log_prob_unreduced']
+    # for spatial-aware advantage shaping; None unless explicitly requested.
+    log_prob_unreduced: Optional[torch.FloatTensor] = None
     noise_pred: Optional[torch.FloatTensor] = None
 
     def to_dict(self) -> Dict[str, Any]:

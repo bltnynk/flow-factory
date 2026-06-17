@@ -417,6 +417,45 @@ def _standardize_clip_range(value, name: str) -> tuple[float, float]:
     return (lo, hi)
 
 
+def _standardize_spatial_shaping(
+    mode: str,
+    strength: float,
+    weight_clip: Union[float, Tuple[float, float]],
+    sigma_window: Union[float, Tuple[float, float]],
+    temperature: float,
+) -> Tuple[str, float, Tuple[float, float], Tuple[float, float], float]:
+    """Validate and normalize spatial-advantage-shaping fields.
+
+    Shared by ``GRPOTrainingArguments``, ``AWMTrainingArguments`` and
+    ``NFTTrainingArguments`` (mirrors how ``global_std`` / ``adv_clip_range`` are
+    duplicated across those subclasses).
+
+    Returns:
+        ``(mode, strength, weight_clip, sigma_window, temperature)`` standardized.
+    """
+    valid_modes = ['sign_aware', 'favor_clean']
+    if mode not in valid_modes:
+        raise ValueError(f"`spatial_shaping_mode` must be one of {valid_modes}, got '{mode}'.")
+
+    strength = float(strength)
+    if strength < 0:
+        raise ValueError(f"`spatial_shaping_strength` must be >= 0, got {strength}.")
+
+    lo, hi = float(weight_clip[0]), float(weight_clip[1])
+    assert 0 < lo < hi, f"`spatial_shaping_weight_clip` must satisfy 0 < min < max, got ({lo}, {hi})."
+
+    s_lo, s_hi = float(sigma_window[0]), float(sigma_window[1])
+    assert 0 <= s_lo < s_hi <= 1, (
+        f"`artifact_sigma_window` must satisfy 0 <= low < high <= 1, got ({s_lo}, {s_hi})."
+    )
+
+    temperature = float(temperature)
+    if temperature <= 0:
+        raise ValueError(f"`artifact_temperature` must be > 0, got {temperature}.")
+
+    return mode, strength, (lo, hi), (s_lo, s_hi), temperature
+
+
 def _standardize_timestep_range(value: Union[float, Tuple[float, float]]) -> Tuple[float, float]:
     """Convert float or tuple to ``(frac_lo, frac_hi)`` along denoising 1000->0.
 
