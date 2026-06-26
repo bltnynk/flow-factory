@@ -16,20 +16,33 @@
 """
 Score-Dynamics utilities for spatial-aware advantage shaping.
 
-Flow-matching adaptation of "Temporal Score Analysis" (ASCED, arXiv:2503.16218).
-ASCED detects visual artifacts/hallucinations by monitoring the per-pixel temporal
-variation of the running predicted-clean image ``x̂₀`` across denoising steps —
-artifact regions exhibit anomalously large variation in a mid-noise window.
+Flow-matching adaptation of the "Temporal Score Analysis" signal from ASCED
+(arXiv:2503.16218). ASCED uses **abnormal score dynamics** across denoising steps to
+flag artifacts; here we repurpose the *same* per-step signal as a **saliency** proxy.
+Regions where the predicted clean image keeps changing across the mid-noise window are
+where the model is actively constructing content — i.e. the subject / important
+foreground — whereas flat low-frequency background settles early and barely moves. We
+therefore read a high score-dynamics response as **high saliency** and use it to focus
+optimization on those regions (rather than to down-weight them as ASCED does).
 
-For flow matching with ``x_σ = (1 - σ) x₀ + σ ε`` and velocity prediction
-``v = ε - x₀`` (the AWM target), the running clean estimate is
+The per-step detector is kept faithful to ASCED Eq. 4 / Algorithm 1 (per-step robust
+z-score against an adaptive MAD threshold), but the per-step responses are aggregated
+over the window by their **mean** (persistence; the default) rather than ASCED's
+running-**max** union — saliency is where the model *consistently* refines content, and
+the mean is robust to transient spikes and invariant to the step count. In flow-matching
+form
+(``x_s = (1-s)x0 + s*eps``, velocity ``v = eps - x0``, ``eps_hat = x_s + (1-s)*v``) the
+per-step signal is one of:
 
-    x̂₀(σ) = x_σ - σ · v_θ(x_σ, σ) = latents - σ · noise_pred
+    pred_x0:        x0_hat = x_s - s * v                              # default (subject saliency)
+    weighted_score: w*s = x0_hat - x_s/(1-s) = -(s/(1-s)) * eps_hat   # ASCED paper's weighted score
 
-Both ``latents`` and ``noise_pred`` are available at every rollout step, so the
-score-dynamics map can be accumulated online during trajectory generation and used
-later (during optimization) to redistribute the scalar per-sample advantage across
-space — upweighting clean regions and downweighting artifact regions.
+``score_type`` selects between them. ``pred_x0`` (the predicted-clean latent, the
+official ASCED code's simplification) is the **default** because its temporal change
+tracks subject content most directly. Both ``latents`` and ``noise_pred`` are available
+at every rollout step, so the signal is formed online; the saliency map is the per-step
+robust z-score aggregated over the window (mean by default) and is used later (during
+optimization) to concentrate the scalar per-sample advantage on salient space.
 
 This module is model- and algorithm-agnostic. It operates on whatever latent layout
 the adapter uses (unpacked ``(B, C, H, W)`` or packed ``(B, seq, C)``): the channel
@@ -68,169 +81,220 @@ def _gaussian_blur_2d(x: torch.Tensor, sigma: float) -> torch.Tensor:
     return x
 
 
-def _robust_normalize(score: torch.Tensor, temperature: float) -> torch.Tensor:
-    """Map a raw per-position score to an artifact intensity in ``[0, 1]``.
+def _robust_z(score: torch.Tensor) -> torch.Tensor:
+    """Per-sample robust z-score of a per-position map.
 
-    Uses per-sample robust statistics (median / MAD) so the result is invariant
-    to per-sample scale, then a sigmoid so the median maps to ``0.5`` and large
-    deviations (candidate artifacts) saturate towards ``1``.
+    ``z = (score - median) / (1.4826 * MAD)`` computed per sample over all non-batch
+    dims. This makes ASCED's per-step threshold ``median + k*1.4826*MAD`` equivalent
+    to the dimensionless test ``z > k``: a position is anomalous iff its ``z`` exceeds
+    the multiplier ``mad_scale``.
 
     Args:
-        score: Raw non-negative per-position score, shape ``(B, ...)`` with the
-            channel dimension already collapsed to a singleton.
-        temperature: Sigmoid temperature; larger values produce a softer map.
+        score: Non-negative per-position map, shape ``(B, ...)`` with the channel
+            dimension already collapsed to a singleton.
 
     Returns:
-        Artifact intensity map in ``(0, 1)`` with the same shape as ``score``.
+        Per-sample robust z-score, same shape as ``score``.
     """
     flat = score.flatten(1)
     median = flat.median(dim=1, keepdim=True).values
     mad = (flat - median).abs().median(dim=1, keepdim=True).values
     z = (flat - median) / (1.4826 * mad + _EPS)
-    artifact = torch.sigmoid(z / max(temperature, _EPS))
-    return artifact.view_as(score)
+    return z.view_as(score)
 
 
 class ScoreDynamicsTracker:
-    """Online accumulator of flow-matching score dynamics during a rollout.
+    """Incremental flow-matching score-dynamics → **saliency map** during a rollout.
 
-    Maintains the running predicted-clean estimate ``x̂₀ = latents - σ · noise_pred``
-    and accumulates the per-element temporal variation ``|x̂₀(σᵢ) - x̂₀(σᵢ₋₁)|`` over
-    consecutive denoising steps whose noise level ``σ`` falls inside a configurable
-    mid-trajectory window. Memory is ``O(latent)`` — only the previous estimate and a
-    running accumulator are kept, never the full sequence.
+    Reuses ASCED's per-step detector (arXiv:2503.16218, Eq. 4 / Algorithm 1): at each
+    in-window step it forms the per-step signal (selected by ``score_type``), takes its
+    temporal difference against the previous in-window step, and normalizes that
+    difference by **per-step** robust statistics. ASCED reads the response as an
+    artifact; here it is read as **saliency** (the subject region the model is actively
+    constructing), so the per-step responses are aggregated across the window by their
+    **mean** (default) rather than ASCED's running-**max** union.
+
+    Per-step signal (flow matching, ``x_s = (1-s)x0 + s*eps``, ``v = eps - x0``,
+    ``eps_hat = x_s + (1-s)*v``)::
+
+        pred_x0:        x0_hat = x_s - s * v                              # default (subject saliency)
+        weighted_score: w*s = x0_hat - x_s/(1-s) = -(s/(1-s)) * eps_hat   # ASCED paper's weighted score
+
+    The accumulator is the per-step robust z-score of ``|Delta(signal)|`` aggregated over
+    steps — the **mean** (default) or running **max**. The mean reads as *persistence*: a
+    position is salient when it is *consistently* refined across the window, so one-off
+    background spikes are averaged down and the result is step-count invariant (the rollout
+    uses few steps; eval many). The max is ASCED's artifact **union** ``U_k {z_k > k}`` and
+    grows with the number of steps. Memory is ``O(latent)`` either way (previous signal +
+    a running max, or a running sum and count; never the full sequence).
 
     Args:
-        sigma_window: ``(low, high)`` σ range over which to accumulate temporal
-            variation. σ runs ``1 → 0`` across the trajectory (high noise → clean),
-            so a mid-window such as ``(0.2, 0.8)`` targets the "mutation" phase where
-            ASCED reports the artifact signal is most informative.
+        sigma_window: ``(low, high)`` sigma range to accumulate over. sigma runs
+            ``1 -> 0`` across the trajectory; a mid-window such as ``(0.2, 0.8)``
+            targets the "mutation" phase where the signal is strongest.
+        channel_dim: Latent channel dimension (``1`` for unpacked ``(B, C, H, W)``,
+            ``-1`` for packed ``(B, seq, C)``); collapsed to a singleton.
+        score_type: ``"pred_x0"`` (the official ASCED code's predicted-clean latent,
+            default — tracks subject content most directly) or ``"weighted_score"``
+            (ASCED paper's weighted score).
+        aggregation: ``"mean"`` (default — persistence; step-count invariant, robust to
+            transient background spikes) or ``"max"`` (ASCED's artifact union; sparser
+            and step-count dependent). ``mad_scale`` is interpreted against whichever is
+            chosen, so its sensible default differs (≈1 for mean, ≈3 for max).
+        mad_scale: Sigmoid centering ``k`` on the aggregated robust z-score; the saliency
+            map crosses ``0.5`` where the aggregate reaches ``k`` (lower ``k`` marks a
+            broader region as salient). Default ``1`` suits the ``mean`` aggregation.
+        temperature: Softness of the sigmoid relaxation around the threshold.
+        smooth_sigma: Per-step 2D Gaussian-blur sigma applied to the difference map
+            (unpacked latents only); ``0`` disables.
     """
 
-    def __init__(self, sigma_window: Tuple[float, float]) -> None:
+    _SCORE_TYPES = ("pred_x0", "weighted_score")
+    _AGGREGATIONS = ("mean", "max")
+
+    def __init__(
+        self,
+        sigma_window: Tuple[float, float],
+        channel_dim: int,
+        score_type: str = "pred_x0",
+        aggregation: str = "mean",
+        mad_scale: float = 1.0,
+        temperature: float = 1.0,
+        smooth_sigma: float = 0.0,
+    ) -> None:
         self.sigma_low, self.sigma_high = float(sigma_window[0]), float(sigma_window[1])
         if not 0.0 <= self.sigma_low < self.sigma_high <= 1.0:
             raise ValueError(
-                f"`artifact_sigma_window` must satisfy 0 <= low < high <= 1, "
+                f"`saliency_sigma_window` must satisfy 0 <= low < high <= 1, "
                 f"got ({self.sigma_low}, {self.sigma_high})."
             )
-        self._accum: Optional[torch.Tensor] = None
-        self._prev_x0: Optional[torch.Tensor] = None
+        if score_type not in self._SCORE_TYPES:
+            raise ValueError(
+                f"`saliency_score_type` must be one of {self._SCORE_TYPES}, got '{score_type}'."
+            )
+        if aggregation not in self._AGGREGATIONS:
+            raise ValueError(
+                f"`saliency_aggregation` must be one of {self._AGGREGATIONS}, got '{aggregation}'."
+            )
+        self.channel_dim = channel_dim
+        self.score_type = score_type
+        self.aggregation = aggregation
+        self.mad_scale = float(mad_scale)
+        self.temperature = max(float(temperature), _EPS)
+        self.smooth_sigma = float(smooth_sigma)
+        self._prev_score_field: Optional[torch.Tensor] = None
+        # 'max' keeps the running maximum (ASCED union); 'mean' keeps a running sum + count.
+        self._running_max_z: Optional[torch.Tensor] = None
+        self._running_sum_z: Optional[torch.Tensor] = None
         self._count: int = 0
 
+    def _score_field(
+        self, latents: torch.Tensor, noise_pred: torch.Tensor, sigma: float
+    ) -> torch.Tensor:
+        """Per-step score-dynamics signal selected by ``score_type``.
+
+        ``weighted_score`` returns ASCED's weighted score ``-(s/(1-s))*eps_hat``
+        (paper); ``pred_x0`` returns the predicted clean latent ``x0_hat = x_s - s*v``
+        (official code).
+        """
+        if self.score_type == "weighted_score":
+            one_minus_sigma = max(1.0 - sigma, _EPS)
+            eps_hat = latents + one_minus_sigma * noise_pred
+            return -(sigma / one_minus_sigma) * eps_hat
+        return latents - sigma * noise_pred
+
     def update(self, latents: torch.Tensor, noise_pred: torch.Tensor, sigma: float) -> None:
-        """Feed one denoising step.
+        """Feed one denoising step (no-op outside the sigma window).
 
         Args:
-            latents: Current latents ``x_σ`` (pre-step), shape ``(B, ...)``.
+            latents: Current latents ``x_s`` (pre-step), shape ``(B, ...)``.
             noise_pred: Velocity prediction at this step, same shape as ``latents``.
-            sigma: Scalar noise level ``σ = t / 1000`` for this step.
+            sigma: Scalar noise level ``sigma = t / 1000`` for this step.
         """
         if not (self.sigma_low <= sigma <= self.sigma_high):
             return
-        x0 = latents.float() - sigma * noise_pred.float()
-        if self._prev_x0 is not None:
-            diff = (x0 - self._prev_x0).abs()
-            self._accum = diff if self._accum is None else self._accum + diff
-            self._count += 1
-        self._prev_x0 = x0
+        score_field = self._score_field(latents.float(), noise_pred.float(), sigma)
 
-    def finalize(
-        self,
-        channel_dim: int,
-        temperature: float = 1.0,
-        smooth_sigma: float = 0.0,
-    ) -> Optional[torch.Tensor]:
-        """Produce the per-sample artifact map from the accumulated dynamics.
+        if self._prev_score_field is not None:
+            diff = (score_field - self._prev_score_field).abs()
+            score = diff.mean(dim=self.channel_dim, keepdim=True)
+            # Per-step spatial smoothing (2D grid only; packed latents have no grid).
+            if self.smooth_sigma > 0.0 and score.ndim == 4:
+                score = _gaussian_blur_2d(score, self.smooth_sigma)
+            # Per-step robust z-score, then incremental aggregation across the window.
+            z = _robust_z(score)
+            if self.aggregation == "max":
+                self._running_max_z = (
+                    z if self._running_max_z is None else torch.maximum(self._running_max_z, z)
+                )
+            else:  # "mean": running sum + count (persistence; O(latent) memory).
+                self._running_sum_z = z if self._running_sum_z is None else self._running_sum_z + z
+                self._count += 1
 
-        Args:
-            channel_dim: Dimension index of the latent channels (e.g. ``1`` for
-                unpacked ``(B, C, H, W)``, ``-1`` for packed ``(B, seq, C)``).
-                Collapsed to a singleton so the map broadcasts over channels.
-            temperature: Sigmoid temperature for robust normalization.
-            smooth_sigma: If ``> 0`` and the map has two spatial dimensions
-                (unpacked latents), apply a 2D Gaussian blur of this σ.
+        self._prev_score_field = score_field
+
+    def finalize(self) -> Optional[torch.Tensor]:
+        """Produce the per-sample saliency map from the accumulated per-step responses.
 
         Returns:
-            Artifact map in ``[0, 1]`` of shape ``(B, ...)`` with the channel
-            dimension collapsed to size ``1`` (high = artifact), or ``None`` when
-            fewer than two in-window steps were seen.
+            Saliency map in ``(0, 1)`` of shape ``(B, ...)`` with the channel dimension
+            collapsed to size ``1`` (high = salient subject region). It is
+            ``sigmoid((A_k - mad_scale) / temperature)`` where ``A_k`` is the per-step
+            robust z-score aggregated across the window: the **mean** (default;
+            persistence — a position is salient when it is *consistently* refined) or the
+            running **max** (ASCED's artifact union). Returns ``None`` when fewer than two
+            in-window steps were seen.
         """
-        if self._accum is None or self._count == 0:
+        if self.aggregation == "max":
+            agg = self._running_max_z
+        else:
+            agg = self._running_sum_z / self._count if self._count > 0 else None
+        if agg is None:
             logger.warning(
                 "ScoreDynamicsTracker saw fewer than two steps inside "
-                f"artifact_sigma_window=({self.sigma_low}, {self.sigma_high}); "
-                "no artifact map produced. Widen the window or increase num_inference_steps."
+                f"saliency_sigma_window=({self.sigma_low}, {self.sigma_high}); "
+                "no saliency map produced. Widen the window or increase num_inference_steps."
             )
             return None
-
-        score = self._accum / self._count
-        score = score.mean(dim=channel_dim, keepdim=True)
-
-        if smooth_sigma > 0.0:
-            if score.ndim == 4:
-                score = _gaussian_blur_2d(score, smooth_sigma)
-            else:
-                logger.warning(
-                    f"artifact_smooth_sigma={smooth_sigma} requested but the latent map "
-                    f"has ndim={score.ndim} (no 2D spatial grid); skipping spatial smoothing."
-                )
-
-        return _robust_normalize(score, temperature)
+        return torch.sigmoid((agg - self.mad_scale) / self.temperature)
 
 
 def compute_spatial_weight(
-    artifact_map: torch.Tensor,
-    advantage: torch.Tensor,
-    mode: str = "sign_aware",
+    saliency_map: torch.Tensor,
     strength: float = 1.0,
     weight_clip: Tuple[float, float] = (0.1, 3.0),
 ) -> torch.Tensor:
-    """Convert an artifact map + scalar advantage into a per-position loss weight.
+    """Convert a saliency map into a per-position loss weight that focuses on salient space.
 
     The weight redistributes the (otherwise spatially uniform) per-sample advantage
-    across space and is normalized to spatial-mean ``1`` per sample, so the overall
-    loss scale is preserved.
+    toward salient regions and is normalized to spatial-mean ``1`` per sample, so the
+    overall loss scale is preserved::
 
-    Modes (``g = 1 - artifact_map`` is the per-position goodness, ``ḡ`` its spatial
-    mean):
+        W = 1 + strength * (S - S_bar)
 
-    - ``"sign_aware"`` (default): ``W = 1 + strength · sign(advantage) · (g - ḡ)``.
-      For positive-advantage samples this upweights clean regions and downweights
-      artifacts (reinforce what is good); for negative-advantage samples it flips —
-      upweighting artifact regions so the penalty concentrates on what is broken.
-    - ``"favor_clean"``: ``W = 1 + strength · (g - ḡ)`` — always favors clean regions
-      regardless of advantage sign.
+    where ``S`` is the saliency map and ``S_bar`` its per-sample spatial mean. Salient
+    regions (high ``S`` — the subject the model is constructing) are upweighted and flat
+    background (low ``S``) is downweighted, so optimization concentrates on content that
+    matters. The weight is **independent of advantage sign and of the policy** (it is
+    fixed from the rollout saliency map), so it never perturbs the on-policy ratio or
+    train-inference consistency — it applies identically to good and bad samples.
 
     Args:
-        artifact_map: Map in ``[0, 1]`` of shape ``(B, ...)`` with a singleton
-            channel dimension (high = artifact).
-        advantage: Per-sample advantage, shape ``(B,)``.
-        mode: ``"sign_aware"`` or ``"favor_clean"``.
-        strength: Modulation strength ``γ >= 0`` (``0`` recovers uniform weighting).
+        saliency_map: Map in ``[0, 1]`` of shape ``(B, ...)`` with a singleton channel
+            dimension (high = salient subject region).
+        strength: Modulation strength ``gamma >= 0`` (``0`` recovers uniform weighting).
         weight_clip: ``(min, max)`` clamp applied before renormalization to keep
             weights positive and bounded.
 
     Returns:
-        Per-position weight of the same shape as ``artifact_map``, broadcastable
+        Per-position weight of the same shape as ``saliency_map``, broadcastable
         against the per-pixel loss and normalized to spatial-mean ``1`` per sample.
     """
-    artifact_map = artifact_map.float()
-    spatial_dims = tuple(range(1, artifact_map.ndim))
+    saliency_map = saliency_map.float()
+    spatial_dims = tuple(range(1, saliency_map.ndim))
 
-    goodness = 1.0 - artifact_map
-    centered = goodness - goodness.mean(dim=spatial_dims, keepdim=True)
-
-    if mode == "sign_aware":
-        broadcast_shape = (-1, *([1] * (artifact_map.ndim - 1)))
-        sign = torch.sign(advantage).to(artifact_map.dtype).view(*broadcast_shape)
-        weight = 1.0 + strength * sign * centered
-    elif mode == "favor_clean":
-        weight = 1.0 + strength * centered
-    else:
-        raise ValueError(
-            f"Unknown spatial_shaping_mode='{mode}'. Valid options: ['sign_aware', 'favor_clean']."
-        )
+    centered = saliency_map - saliency_map.mean(dim=spatial_dims, keepdim=True)
+    weight = 1.0 + strength * centered
 
     weight = weight.clamp(min=weight_clip[0], max=weight_clip[1])
     weight = weight / weight.mean(dim=spatial_dims, keepdim=True).clamp_min(_EPS)
@@ -245,24 +309,22 @@ def maybe_compute_spatial_weight(
 
     Single entry point shared by all trainers. Returns ``None`` (so callers fall back
     to the unweighted reduction) when spatial shaping is disabled or the batch carries
-    no artifact map (e.g. an adapter that did not compute one).
+    no saliency map (e.g. an adapter that did not compute one).
 
     Args:
         training_args: The active ``TrainingArguments`` (read for the shaping config).
-        batch: Stacked batch dict; must expose ``artifact_map`` and ``advantage``.
+        batch: Stacked batch dict; must expose ``saliency_map``.
 
     Returns:
         Per-position weight broadcastable against the per-pixel loss, or ``None``.
     """
     if not getattr(training_args, "spatial_advantage_shaping", False):
         return None
-    artifact_map = batch.get("artifact_map")
-    if artifact_map is None:
+    saliency_map = batch.get("saliency_map")
+    if saliency_map is None:
         return None
     return compute_spatial_weight(
-        artifact_map=artifact_map,
-        advantage=batch["advantage"],
-        mode=training_args.spatial_shaping_mode,
+        saliency_map=saliency_map,
         strength=training_args.spatial_shaping_strength,
         weight_clip=training_args.spatial_shaping_weight_clip,
     )

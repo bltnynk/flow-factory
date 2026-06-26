@@ -418,25 +418,24 @@ def _standardize_clip_range(value, name: str) -> tuple[float, float]:
 
 
 def _standardize_spatial_shaping(
-    mode: str,
     strength: float,
     weight_clip: Union[float, Tuple[float, float]],
     sigma_window: Union[float, Tuple[float, float]],
+    score_type: str,
+    aggregation: str,
+    mad_scale: float,
     temperature: float,
-) -> Tuple[str, float, Tuple[float, float], Tuple[float, float], float]:
-    """Validate and normalize spatial-advantage-shaping fields.
+) -> Tuple[float, Tuple[float, float], Tuple[float, float], str, str, float, float]:
+    """Validate and normalize spatial-advantage-shaping (score-dynamics saliency) fields.
 
     Shared by ``GRPOTrainingArguments``, ``AWMTrainingArguments`` and
     ``NFTTrainingArguments`` (mirrors how ``global_std`` / ``adv_clip_range`` are
     duplicated across those subclasses).
 
     Returns:
-        ``(mode, strength, weight_clip, sigma_window, temperature)`` standardized.
+        ``(strength, weight_clip, sigma_window, score_type, aggregation, mad_scale,
+        temperature)`` standardized.
     """
-    valid_modes = ['sign_aware', 'favor_clean']
-    if mode not in valid_modes:
-        raise ValueError(f"`spatial_shaping_mode` must be one of {valid_modes}, got '{mode}'.")
-
     strength = float(strength)
     if strength < 0:
         raise ValueError(f"`spatial_shaping_strength` must be >= 0, got {strength}.")
@@ -446,14 +445,30 @@ def _standardize_spatial_shaping(
 
     s_lo, s_hi = float(sigma_window[0]), float(sigma_window[1])
     assert 0 <= s_lo < s_hi <= 1, (
-        f"`artifact_sigma_window` must satisfy 0 <= low < high <= 1, got ({s_lo}, {s_hi})."
+        f"`saliency_sigma_window` must satisfy 0 <= low < high <= 1, got ({s_lo}, {s_hi})."
     )
+
+    valid_score_types = ['pred_x0', 'weighted_score']
+    if score_type not in valid_score_types:
+        raise ValueError(
+            f"`saliency_score_type` must be one of {valid_score_types}, got '{score_type}'."
+        )
+
+    valid_aggregations = ['mean', 'max']
+    if aggregation not in valid_aggregations:
+        raise ValueError(
+            f"`saliency_aggregation` must be one of {valid_aggregations}, got '{aggregation}'."
+        )
+
+    mad_scale = float(mad_scale)
+    if mad_scale < 0:
+        raise ValueError(f"`saliency_mad_scale` must be >= 0, got {mad_scale}.")
 
     temperature = float(temperature)
     if temperature <= 0:
-        raise ValueError(f"`artifact_temperature` must be > 0, got {temperature}.")
+        raise ValueError(f"`saliency_temperature` must be > 0, got {temperature}.")
 
-    return mode, strength, (lo, hi), (s_lo, s_hi), temperature
+    return strength, (lo, hi), (s_lo, s_hi), score_type, aggregation, mad_scale, temperature
 
 
 def _standardize_timestep_range(value: Union[float, Tuple[float, float]]) -> Tuple[float, float]:

@@ -1,11 +1,11 @@
-# AWM + Spatial-Aware Advantage Shaping (score dynamics).
+# AWM + Spatial-Aware Advantage Shaping (score-dynamics saliency).
 #
-# Adds a per-pixel artifact map derived from flow-matching score dynamics
-# (ASCED, arXiv:2503.16218) during rollout, then weights AWM's per-pixel
-# matching loss with it during optimization: the velocity-matching error on
-# clean regions of high-advantage samples is emphasized, while artifact
-# regions of low-advantage samples carry more of the (negative) weight.
-# See `flow_factory/utils/score_dynamics.py`.
+# Derives a per-pixel saliency map from flow-matching score dynamics
+# (ASCED, arXiv:2503.16218) during rollout, then focuses AWM's per-pixel
+# matching loss on salient (subject) regions during optimization: the
+# velocity-matching error on regions the model is actively constructing is
+# emphasized and flat background is de-emphasized. The weight is sign- and
+# policy-independent. See `flow_factory/utils/score_dynamics.py`.
 #
 # Set `spatial_advantage_shaping: false` to recover the AWM baseline
 # (examples/awm/lora/sd3_5/default.yaml).
@@ -80,14 +80,16 @@ train:
   warmup_steps: 1000
   ema_device: "cuda"  # Device to store EMA model (options: cpu, cuda)
 
-  # --- Spatial-aware advantage shaping (score dynamics) ---
+  # --- Spatial-aware advantage shaping (score-dynamics saliency) ---
   spatial_advantage_shaping: true  # Enable; false recovers the AWM baseline
-  spatial_shaping_mode: 'sign_aware'  # Options: 'sign_aware', 'favor_clean'
   spatial_shaping_strength: 1.0  # Modulation strength gamma (>= 0); 0 == uniform weighting
   spatial_shaping_weight_clip: [0.1, 3.0]  # (min, max) clamp on the per-pixel weight
-  artifact_sigma_window: [0.2, 0.8]  # Mid-noise sigma window for score-dynamics accumulation (sigma runs 1->0)
-  artifact_smooth_sigma: 1.0  # Gaussian-blur sigma (latent pixels) for the map; 0 disables (SD3.5 has 2D latents)
-  artifact_temperature: 1.0  # Sigmoid temperature for robust normalization; larger is softer
+  saliency_sigma_window: [0.2, 0.8]  # Mid-noise sigma window for score-dynamics accumulation (sigma runs 1->0)
+  saliency_score_type: 'pred_x0'  # Options: 'pred_x0' (subject saliency, default), 'weighted_score' (ASCED paper)
+  saliency_aggregation: 'mean'  # Options: 'mean' (persistence, default; step-count invariant), 'max' (ASCED union; pair with mad_scale~3)
+  saliency_mad_scale: 1.0  # Sigmoid centering k on aggregated robust-z; lower marks a broader salient region (1 suits 'mean')
+  saliency_smooth_sigma: 1.0  # Per-step Gaussian-blur sigma (latent pixels); 0 disables (SD3.5 has 2D latents)
+  saliency_temperature: 1.0  # Sigmoid softness around the MAD threshold; larger is softer
 
   # Sampling Settings
   resolution: 512  # Can be int or [height, width]

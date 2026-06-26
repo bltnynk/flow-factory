@@ -60,17 +60,10 @@ class GRPOTrainingArguments(TrainingArguments):
     spatial_advantage_shaping: bool = field(
         default=False,
         metadata={"help": (
-            "Enable spatial-aware advantage shaping: derive a per-pixel artifact map from "
-            "flow-matching score dynamics during rollout and use it to redistribute the scalar "
-            "per-sample advantage across space during optimization. Off by default (byte-identical to baseline)."
-        )},
-    )
-    spatial_shaping_mode: Literal['sign_aware', 'favor_clean'] = field(
-        default='sign_aware',
-        metadata={"help": (
-            "How the artifact map reshapes the loss. 'sign_aware': reinforce clean regions of "
-            "positive-advantage samples and concentrate the penalty on artifact regions of "
-            "negative-advantage samples. 'favor_clean': always upweight clean regions."
+            "Enable spatial-aware advantage shaping: derive a per-pixel saliency map from "
+            "flow-matching score dynamics during rollout and use it to focus the scalar "
+            "per-sample advantage on salient (subject) regions during optimization. "
+            "Off by default (byte-identical to baseline)."
         )},
     )
     spatial_shaping_strength: float = field(
@@ -81,20 +74,44 @@ class GRPOTrainingArguments(TrainingArguments):
         default=(0.1, 3.0),
         metadata={"help": "(min, max) clamp on the per-pixel weight before spatial-mean-1 renormalization."},
     )
-    artifact_sigma_window: Tuple[float, float] = field(
+    saliency_sigma_window: Tuple[float, float] = field(
         default=(0.2, 0.8),
         metadata={"help": (
             "Noise-level sigma window over which score dynamics are accumulated (sigma runs 1->0; "
-            "a mid window targets the artifact-revealing 'mutation' phase)."
+            "a mid window targets the content-revealing 'mutation' phase)."
         )},
     )
-    artifact_smooth_sigma: float = field(
-        default=0.0,
-        metadata={"help": "Gaussian-blur sigma (latent pixels) for the artifact map; 0 disables. Unpacked 2D latents only."},
+    saliency_score_type: Literal['pred_x0', 'weighted_score'] = field(
+        default='pred_x0',
+        metadata={"help": (
+            "Per-step score-dynamics signal. 'pred_x0' (default): predicted-clean latent, tracks "
+            "subject content most directly. 'weighted_score': ASCED paper's weighted score."
+        )},
     )
-    artifact_temperature: float = field(
+    saliency_aggregation: Literal['mean', 'max'] = field(
+        default='mean',
+        metadata={"help": (
+            "How per-step robust-z responses are aggregated over the sigma window. 'mean' (default): "
+            "persistence — salient where the model consistently refines content; step-count invariant and "
+            "robust to transient background spikes. 'max': ASCED's artifact union; sparser, step-count "
+            "dependent (pair with a higher saliency_mad_scale, ~3)."
+        )},
+    )
+    saliency_mad_scale: float = field(
         default=1.0,
-        metadata={"help": "Sigmoid temperature for robust normalization of the artifact map; larger is softer."},
+        metadata={"help": (
+            "Sigmoid centering k on the aggregated robust-z (median + k*1.4826*MAD); the saliency map "
+            "crosses 0.5 where the aggregate reaches k. Lower k marks a broader salient region. Default 1 "
+            "suits 'mean' aggregation; use ~3 for 'max'."
+        )},
+    )
+    saliency_smooth_sigma: float = field(
+        default=1.0,
+        metadata={"help": "Per-step Gaussian-blur sigma (latent pixels) for the difference map; 0 disables. Unpacked 2D latents only (no-op for packed)."},
+    )
+    saliency_temperature: float = field(
+        default=1.0,
+        metadata={"help": "Sigmoid softness of the saliency map around the centering threshold; larger is softer."},
     )
 
     def __post_init__(self):
@@ -106,19 +123,23 @@ class GRPOTrainingArguments(TrainingArguments):
         if self.kl_type not in ['v-based', 'x-based']:
             raise ValueError(f"Invalid KL type: {self.kl_type}. Valid options are: ['v-based', 'x-based'].")
         (
-            self.spatial_shaping_mode,
             self.spatial_shaping_strength,
             self.spatial_shaping_weight_clip,
-            self.artifact_sigma_window,
-            self.artifact_temperature,
+            self.saliency_sigma_window,
+            self.saliency_score_type,
+            self.saliency_aggregation,
+            self.saliency_mad_scale,
+            self.saliency_temperature,
         ) = _standardize_spatial_shaping(
-            self.spatial_shaping_mode,
             self.spatial_shaping_strength,
             self.spatial_shaping_weight_clip,
-            self.artifact_sigma_window,
-            self.artifact_temperature,
+            self.saliency_sigma_window,
+            self.saliency_score_type,
+            self.saliency_aggregation,
+            self.saliency_mad_scale,
+            self.saliency_temperature,
         )
-        self.artifact_smooth_sigma = float(self.artifact_smooth_sigma)
+        self.saliency_smooth_sigma = float(self.saliency_smooth_sigma)
 
     def get_num_train_timesteps(self, args: Any) -> int:
         return args.scheduler_args.num_sde_steps

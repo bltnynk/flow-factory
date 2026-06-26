@@ -200,9 +200,12 @@ class SD3_5Adapter(BaseAdapter):
         trajectory_indices: TrajectoryIndicesType = 'all',
         # Spatial-aware advantage shaping (score dynamics)
         spatial_advantage_shaping: bool = False,
-        artifact_sigma_window: Tuple[float, float] = (0.2, 0.8),
-        artifact_smooth_sigma: float = 0.0,
-        artifact_temperature: float = 1.0,
+        saliency_sigma_window: Tuple[float, float] = (0.2, 0.8),
+        saliency_score_type: str = "pred_x0",
+        saliency_aggregation: str = "mean",
+        saliency_mad_scale: float = 1.0,
+        saliency_smooth_sigma: float = 1.0,
+        saliency_temperature: float = 1.0,
     ) -> List[SD3_5Sample]:
         # 1. Setup
         device = self.device
@@ -279,8 +282,19 @@ class SD3_5Adapter(BaseAdapter):
         # Spatial-aware advantage shaping: accumulate score dynamics online and (for
         # log-prob-based algorithms) collect the per-pixel SDE log-prob so the
         # spatially-weighted ratio stays consistent between rollout and optimization.
+        # SD3.5 latents are unpacked (B, C, H, W), so channel_dim=1 and 2D smoothing applies.
         score_dynamics_tracker = (
-            ScoreDynamicsTracker(artifact_sigma_window) if spatial_advantage_shaping else None
+            ScoreDynamicsTracker(
+                sigma_window=saliency_sigma_window,
+                channel_dim=1,
+                score_type=saliency_score_type,
+                aggregation=saliency_aggregation,
+                mad_scale=saliency_mad_scale,
+                temperature=saliency_temperature,
+                smooth_sigma=saliency_smooth_sigma,
+            )
+            if spatial_advantage_shaping
+            else None
         )
         log_prob_unreduced_collector = (
             create_trajectory_collector(trajectory_indices, num_inference_steps)
@@ -291,10 +305,13 @@ class SD3_5Adapter(BaseAdapter):
         for i, t in enumerate(timesteps):
             current_noise_level = self.scheduler.get_noise_level_for_timestep(t)
             t_next = timesteps[i + 1] if i + 1 < len(timesteps) else torch.tensor(0, device=device)
-            return_kwargs = list(set(['next_latents', 'log_prob', 'noise_pred'] + extra_call_back_kwargs))
-            if log_prob_unreduced_collector is not None:
-                return_kwargs.append('log_prob_unreduced')
             current_compute_log_prob = compute_log_prob and current_noise_level > 0
+            return_kwargs = list(set(['next_latents', 'log_prob', 'noise_pred'] + extra_call_back_kwargs))
+            # Only request the per-pixel SDE log-prob on steps that actually compute it (mirrors
+            # the collection gate below); deterministic steps don't, and requesting it there would
+            # log a spurious "not available in the step output" warning every step.
+            if log_prob_unreduced_collector is not None and current_compute_log_prob:
+                return_kwargs.append('log_prob_unreduced')
 
             output = self.forward(
                 t=t,
@@ -312,7 +329,7 @@ class SD3_5Adapter(BaseAdapter):
             )
 
             if score_dynamics_tracker is not None:
-                # x̂₀ = latents - σ·v uses the current (pre-step) latents and velocity.
+                # Per-step score-dynamics signal uses the current (pre-step) latents and velocity.
                 score_dynamics_tracker.update(latents, output.noise_pred, float(flow_match_sigma(t)))
 
             latents = self.cast_latents(output.next_latents, default_dtype=dtype)
@@ -339,15 +356,9 @@ class SD3_5Adapter(BaseAdapter):
         latent_index_map = latent_collector.get_index_map()            # (T+1,) LongTensor
         all_log_probs = log_prob_collector.get_result() if compute_log_prob else None
         log_prob_index_map = log_prob_collector.get_index_map() if compute_log_prob else None
-        # Score-dynamics artifact map (B, 1, H, W) and per-pixel log-probs, or None when disabled.
-        artifact_map = (
-            score_dynamics_tracker.finalize(
-                channel_dim=1,
-                temperature=artifact_temperature,
-                smooth_sigma=artifact_smooth_sigma,
-            )
-            if score_dynamics_tracker is not None
-            else None
+        # Score-dynamics saliency map (B, 1, H, W) and per-pixel log-probs, or None when disabled.
+        saliency_map = (
+            score_dynamics_tracker.finalize() if score_dynamics_tracker is not None else None
         )
         all_log_probs_unreduced = (
             log_prob_unreduced_collector.get_result() if log_prob_unreduced_collector is not None else None
@@ -361,7 +372,7 @@ class SD3_5Adapter(BaseAdapter):
                 latent_index_map=latent_index_map,
                 log_prob_index_map=log_prob_index_map,
                 # Spatial-aware advantage shaping
-                artifact_map=artifact_map[b] if artifact_map is not None else None,
+                saliency_map=saliency_map[b] if saliency_map is not None else None,
                 log_probs_unreduced=(
                     torch.stack([lp[b] for lp in all_log_probs_unreduced], dim=0)
                     if all_log_probs_unreduced is not None
