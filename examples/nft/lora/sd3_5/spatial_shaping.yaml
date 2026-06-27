@@ -13,7 +13,7 @@
 launcher: "accelerate"  # Options: accelerate
 config_file: config/deepspeed/deepspeed_zero2.yaml  # Path to distributed config file (optional)
 num_processes: 8  # Number of processes to launch (overrides config file)
-main_process_port: 29500
+main_process_port: 29501
 mixed_precision: "bf16"  # Options: no, fp16, bf16
 
 # Data Configuration
@@ -43,7 +43,7 @@ model:
   resume_type: null # Options: lora, full, state. Null to auto-detect based on `finetune_type`
 
 log:
-  run_name: nft_spatial_sd3_5_lora_default  # Run name (auto: {model_type}_{finetune_type}_{timestamp})
+  run_name: nft_spatial_stronger_sd3_5_lora_default  # Run name (auto: {model_type}_{finetune_type}_{timestamp})
   project: "Flow-Factory"  # Project name for logging
   logging_backend: "wandb"  # Options: wandb, swanlab, none
   save_dir: "saves/"  # Directory to save model checkpoints and logs
@@ -78,14 +78,14 @@ train:
 
   # --- Spatial-aware advantage shaping (score-dynamics saliency) ---
   spatial_advantage_shaping: true  # Enable; false recovers the DiffusionNFT baseline
-  spatial_shaping_strength: 1.0  # Modulation strength gamma (>= 0); 0 == uniform weighting
-  spatial_shaping_weight_clip: [0.1, 3.0]  # (min, max) clamp on the per-pixel weight
+  spatial_shaping_strength: 4.0  # Modulation strength gamma (>= 0); 0 == uniform weighting
+  spatial_shaping_weight_clip: [0.05, 6.0]  # (min, max) clamp on the per-pixel weight
   saliency_sigma_window: [0.2, 0.8]  # Mid-noise sigma window for score-dynamics accumulation (sigma runs 1->0)
   saliency_score_type: 'pred_x0'  # Options: 'pred_x0' (subject saliency, default), 'weighted_score' (ASCED paper)
   saliency_aggregation: 'mean'  # Options: 'mean' (persistence, default; step-count invariant), 'max' (ASCED union; pair with mad_scale~3)
   saliency_mad_scale: 1.0  # Sigmoid centering k on aggregated robust-z; lower marks a broader salient region (1 suits 'mean')
   saliency_smooth_sigma: 1.0  # Per-step Gaussian-blur sigma (latent pixels); 0 disables (SD3.5 has 2D latents)
-  saliency_temperature: 1.0  # Sigmoid softness around the MAD threshold; larger is softer
+  saliency_temperature: 0.4  # Sigmoid softness around the MAD threshold; larger is softer
 
   # Sampling Settings
   resolution: 512  # Can be int or [height, width]
@@ -120,7 +120,7 @@ scheduler:
 # Evaluation settings
 eval:
   resolution: 512  # Evaluation resolution
-  per_device_batch_size: 4  # Eval batch size
+  per_device_batch_size: 8  # Eval batch size
   guidance_scale: 1.0  # Guidance scale for sampling
   num_inference_steps: 40  # Number of eval timesteps
   eval_freq: 10  # Eval frequency in epochs (0 to disable)
