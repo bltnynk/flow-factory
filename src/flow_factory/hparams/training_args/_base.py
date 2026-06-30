@@ -264,6 +264,64 @@ class TrainingArguments(ArgABC):
         )},
     )
 
+    # --- Dynamic (adaptive) rollout allocation ---
+    # Two-phase rollout that redistributes a FIXED epoch budget (M*K) across
+    # prompts by a per-phase-1 metric. Default off -> uniform K-per-prompt
+    # baseline (FlowGRPO / DiffusionNFT / AWM) runs unchanged. See
+    # trainers/dynamic_allocation.py and
+    # .agents/knowledge/topics/dynamic_allocation.md.
+    dynamic_allocation: bool = field(
+        default=False,
+        metadata={"help": (
+            "Enable two-phase adaptive rollout allocation. Phase 1 rolls out "
+            "`dynamic_allocation_phase1_ratio` of the per-prompt budget uniformly, "
+            "scores each prompt by `dynamic_allocation_metric`, then phase 2 "
+            "allocates the remaining budget by `dynamic_allocation_strategy`. The "
+            "epoch total (unique_sample_num_per_epoch * group_size) is held fixed. "
+            "v1 supports a single training source and pointwise rewards only."
+        )},
+    )
+    dynamic_allocation_phase1_ratio: float = field(
+        default=0.5,
+        metadata={"help": (
+            "Fraction x of the per-prompt budget K rolled out in phase 1 "
+            "(K1 = round(x * group_size), clamped to [2, group_size - 1]). "
+            "Must be in (0, 1)."
+        )},
+    )
+    dynamic_allocation_metric: str = field(
+        default="std",
+        metadata={"help": (
+            "Per-prompt phase-1 scoring metric. Options: 'std' (reward spread; "
+            "higher = stronger advantage signal, recommended), 'mean' (average "
+            "reward). Extend via `register_dynamic_allocation_metric`."
+        )},
+    )
+    dynamic_allocation_metric_direction: Literal["higher", "lower"] = field(
+        default="higher",
+        metadata={"help": (
+            "Whether a higher or lower metric earns more phase-2 budget. "
+            "Options: 'higher', 'lower'. ('std' is well-motivated with 'higher'; "
+            "for 'mean' the direction is a hypothesis worth testing both ways.)"
+        )},
+    )
+    dynamic_allocation_strategy: Literal["proportional", "rank_linear"] = field(
+        default="proportional",
+        metadata={"help": (
+            "How the metric maps to phase-2 budget. Options: 'proportional' "
+            "(budget proportional to the shifted metric), 'rank_linear' "
+            "(budget linear in metric rank; magnitude-insensitive)."
+        )},
+    )
+    dynamic_allocation_min_per_prompt: int = field(
+        default=0,
+        metadata={"help": (
+            "Minimum phase-2 (extra) rollouts guaranteed to every prompt. 0 lets "
+            "low-ranked prompts keep only their K1 phase-1 rollouts. Must satisfy "
+            "min_per_prompt * unique_sample_num_per_epoch <= phase-2 budget."
+        )},
+    )
+
     def __post_init__(self):
         # --- Resolution standardization ---
         if not self.resolution:
@@ -341,6 +399,34 @@ class TrainingArguments(ArgABC):
             logger.info(f"`learning_rate` is not set, using default {self.learning_rate} for `{self.trainer_type}` training.")
         else:
             self.learning_rate = float(self.learning_rate)
+
+        # --- Dynamic allocation validation (range only; metric/strategy names
+        # are validated at runtime in trainers/dynamic_allocation.py to avoid a
+        # hparams -> trainers import cycle). ---
+        if self.dynamic_allocation:
+            if self.trainer_type.lower() not in {"grpo", "nft", "awm"}:
+                raise ValueError(
+                    "`dynamic_allocation` is only wired for trainer_type in "
+                    f"{{grpo, nft, awm}}, got '{self.trainer_type}'. Other trainers "
+                    "(e.g. grpo-guard, dpo, dgpo, crd) keep the uniform rollout path."
+                )
+            self.dynamic_allocation_phase1_ratio = float(self.dynamic_allocation_phase1_ratio)
+            if not 0.0 < self.dynamic_allocation_phase1_ratio < 1.0:
+                raise ValueError(
+                    f"`dynamic_allocation_phase1_ratio` must be in (0, 1), got "
+                    f"{self.dynamic_allocation_phase1_ratio}."
+                )
+            if self.dynamic_allocation_min_per_prompt < 0:
+                raise ValueError(
+                    f"`dynamic_allocation_min_per_prompt` must be >= 0, got "
+                    f"{self.dynamic_allocation_min_per_prompt}."
+                )
+            if self.group_size < 3:
+                raise ValueError(
+                    f"`dynamic_allocation` requires `group_size` >= 3 (got "
+                    f"{self.group_size}): phase 1 needs >= 2 rollouts per prompt and "
+                    "phase 2 needs a non-empty remaining budget."
+                )
 
     def compute_gradient_accumulation_steps(
         self, num_batches_per_epoch: int,

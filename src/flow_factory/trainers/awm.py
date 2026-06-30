@@ -34,6 +34,7 @@ tqdm = partial(tqdm_.tqdm, dynamic_ncols=True)
 
 
 from .abc import BaseTrainer
+from .dynamic_allocation import generate_samples_dynamicallocation
 from ..hparams import AWMTrainingArguments
 from ..samples import BaseSample
 from ..rewards import BaseRewardModel, RewardBuffer
@@ -204,6 +205,12 @@ class AWMTrainer(BaseTrainer):
     # =========================== Sampling Loop ============================
     def sample(self) -> List[BaseSample]:
         """Generate rollouts for AWM (final latents only)."""
+        if self.training_args.dynamic_allocation:
+            return generate_samples_dynamicallocation(
+                self,
+                compute_log_prob=False,
+                trajectory_indices=[-1],
+            )
         return self.generate_samples(
             reward_buffer=self.reward_buffer,
             compute_log_prob=False,
@@ -319,7 +326,12 @@ class AWMTrainer(BaseTrainer):
 
     def prepare_feedback(self, samples: List[BaseSample]) -> None:
         """Finalize rewards, compute advantages, and log advantage metrics."""
-        rewards = self.reward_buffer.finalize(store_to_samples=True, split='all')
+        if self.training_args.dynamic_allocation:
+            # Rewards were already computed per phase in sample(); reuse them
+            # (aligned to `samples`) instead of re-running the reward models.
+            rewards = self._dynamicallocation_rewards
+        else:
+            rewards = self.reward_buffer.finalize(store_to_samples=True, split='all')
         self.compute_advantages(samples, rewards, store_to_samples=True)
         adv_metrics = self.advantage_processor.pop_advantage_metrics()
         if adv_metrics:

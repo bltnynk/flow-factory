@@ -583,6 +583,21 @@ class Arguments(ArgABC):
             )
             self.data_args.sampler_type = "group_distributed"
 
+        # Dynamic (adaptive) rollout allocation scatters each prompt's rollouts
+        # across ranks (the per-phase job lists are sliced evenly for equal
+        # per-rank counts), so reward/advantage grouping must use the
+        # cross-rank gather path. Force `distributed_k_repeat` regardless of the
+        # auto/async resolution above. The training DataLoader's sampler is not
+        # iterated in this mode (generation is index-addressed), but the type
+        # still drives `AdvantageProcessor`'s communication strategy.
+        if getattr(ta, "dynamic_allocation", False) and self.data_args.sampler_type != "distributed_k_repeat":
+            logger.warning(
+                "dynamic_allocation requires sampler_type='distributed_k_repeat' "
+                f"(cross-rank gather). Overriding '{self.data_args.sampler_type}' "
+                "-> 'distributed_k_repeat'."
+            )
+            self.data_args.sampler_type = "distributed_k_repeat"
+
 
     def _align_batch_geometry(self) -> None:
         """Align ``unique_sample_num_per_epoch`` (and, for ``group_distributed``,

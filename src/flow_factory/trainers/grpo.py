@@ -27,6 +27,7 @@ import tqdm as tqdm_
 tqdm = partial(tqdm_.tqdm, dynamic_ncols=True)
 
 from .abc import BaseTrainer
+from .dynamic_allocation import generate_samples_dynamicallocation
 from ..hparams import GRPOTrainingArguments
 from ..samples import BaseSample
 from ..utils.base import filter_kwargs, create_generator_by_prompt
@@ -97,6 +98,12 @@ class GRPOTrainer(BaseTrainer):
             train_timestep_indices=self.adapter.scheduler.train_timesteps,
             num_inference_steps=self.training_args.num_inference_steps,
         )
+        if self.training_args.dynamic_allocation:
+            return generate_samples_dynamicallocation(
+                self,
+                compute_log_prob=True,
+                trajectory_indices=trajectory_indices,
+            )
         return self.generate_samples(
             reward_buffer=self.reward_buffer,
             compute_log_prob=True,
@@ -106,7 +113,12 @@ class GRPOTrainer(BaseTrainer):
     # =========================== Reward / advantage (Stages 4--5) ============================
     def prepare_feedback(self, samples: List[BaseSample]) -> None:
         """Finalize rewards from the buffer, compute advantages, and log advantage metrics."""
-        rewards = self.reward_buffer.finalize(store_to_samples=True, split='all')
+        if self.training_args.dynamic_allocation:
+            # Rewards were already computed per phase in sample(); reuse them
+            # (aligned to `samples`) instead of re-running the reward models.
+            rewards = self._dynamicallocation_rewards
+        else:
+            rewards = self.reward_buffer.finalize(store_to_samples=True, split='all')
         self.compute_advantages(samples, rewards, store_to_samples=True)
         adv_metrics = self.advantage_processor.pop_advantage_metrics()
         if adv_metrics:
