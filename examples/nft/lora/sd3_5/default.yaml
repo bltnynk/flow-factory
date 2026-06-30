@@ -10,15 +10,15 @@ mixed_precision: "bf16"  # Options: no, fp16, bf16
 data:
   datasets:
     - name: default  # Unique identifier (used in metrics, caching, reward routing)
-      dataset_dir: "dataset/pickscore"  # Folder with train.jsonl / test.jsonl
+      dataset_dir: "dataset/geneval"  # Folder with train.jsonl / test.jsonl
       train:  # Training participation config
         weight: 1  # Mixing weight (integer); ratio with other sources determines batch allocation
-        max_dataset_size: 1024  # Cap on number of training samples for this source
+        max_dataset_size: null  # Cap on number of training samples for this source
       eval: {}  # Eval participation (inherits shared `eval:` section settings)
   preprocessing_batch_size: 8  # Batch size for preprocessing
   dataloader_num_workers: 16  # Number of workers for DataLoader
   force_reprocess: false  # Force reprocessing of the dataset
-  cache_dir: "~/.cache/flow_factory/datasets" # Cache directory for preprocessed datasets
+  cache_dir: "/mnt/localssd/.cache/flow_factory/datasets" # Cache directory for preprocessed datasets
   sampler_type: "auto"  # Options: auto, distributed_k_repeat, group_contiguous
 
 # Model Configuration
@@ -34,11 +34,11 @@ model:
   # attn_backend: '_flash_3_hub' # Attention backend for training.
 
 log:
-  run_name: null  # Run name (auto: {model_type}_{finetune_type}_{timestamp})
+  run_name: nft_geneval_default  # Run name (auto: {model_type}_{finetune_type}_{timestamp})
   project: "Flow-Factory"  # Project name for logging
   logging_backend: "wandb"  # Options: wandb, swanlab, none
-  save_dir: "saves/"  # Directory to save model checkpoints and logs
-  save_freq: 20  # Save frequency in epochs (0 to disable)
+  save_dir: "/mnt/localssd/.cache/flow_factory/saves/"  # Directory to save model checkpoints and logs
+  save_freq: 10  # Save frequency in epochs (0 to disable)
   save_model_only: true  # Save only the model weights (not optimizer, scheduler, etc.)
   
 # Training Configuration
@@ -100,25 +100,25 @@ scheduler:
 # Evaluation settings
 eval:
   resolution: 512  # Evaluation resolution
-  per_device_batch_size: 4  # Eval batch size
+  per_device_batch_size: 8  # Eval batch size
   guidance_scale: 1.0  # Guidance scale for sampling
   num_inference_steps: 40  # Number of eval timesteps
-  eval_freq: 20  # Eval frequency in epochs (0 to disable)
+  eval_freq: 10  # Eval frequency in epochs (0 to disable)
   seed: 42  # Eval seed (defaults to training seed)
 
 # Reward Model Configuration
 rewards:
-  - name: "pick_score"
-    reward_model: "PickScore"
+  - name: "geneval"
+    reward_model: "geneval"
     weight: 1  # Weight of this reward model
-    batch_size: 16
+    batch_size: 32
     device: "cuda"
     dtype: bfloat16
 
 # Optional Evaluation Reward Models
 eval_rewards:
-  - name: "pick_score"
-    reward_model: "PickScore"
+  - name: "geneval"
+    reward_model: "geneval"
     batch_size: 32
     device: "cuda"
     dtype: bfloat16
