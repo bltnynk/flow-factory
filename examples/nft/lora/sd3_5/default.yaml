@@ -34,7 +34,7 @@ model:
   # attn_backend: '_flash_3_hub' # Attention backend for training.
 
 log:
-  run_name: nft_geneval_default  # Run name (auto: {model_type}_{finetune_type}_{timestamp})
+  run_name: nft_group4_default  # Run name (auto: {model_type}_{finetune_type}_{timestamp})
   project: "Flow-Factory"  # Project name for logging
   logging_backend: "wandb"  # Options: wandb, swanlab, none
   save_dir: "/mnt/localssd/.cache/flow_factory/saves/"  # Directory to save model checkpoints and logs
@@ -74,7 +74,7 @@ train:
 
   # Batch and sampling
   per_device_batch_size: 8  # Batch size per device. For image-to-image task, this will always fallback to 1.
-  group_size: 16  # Group size for GRPO sampling
+  group_size: 4  # Group size for GRPO sampling
   global_std: false  # Use global std for advantage normalization
   unique_sample_num_per_epoch: 48  # Unique samples per group
   gradient_step_per_epoch: 1  # Gradient steps per epoch
@@ -100,7 +100,7 @@ scheduler:
 # Evaluation settings
 eval:
   resolution: 512  # Evaluation resolution
-  per_device_batch_size: 8  # Eval batch size
+  per_device_batch_size: 32  # Eval batch size
   guidance_scale: 1.0  # Guidance scale for sampling
   num_inference_steps: 40  # Number of eval timesteps
   eval_freq: 10  # Eval frequency in epochs (0 to disable)

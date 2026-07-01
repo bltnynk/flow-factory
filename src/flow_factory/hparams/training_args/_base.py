@@ -294,7 +294,9 @@ class TrainingArguments(ArgABC):
         metadata={"help": (
             "Per-prompt phase-1 scoring metric. Options: 'std' (reward spread; "
             "higher = stronger advantage signal, recommended), 'mean' (average "
-            "reward). Extend via `register_dynamic_allocation_metric`."
+            "reward), 'advantage' (mean absolute group-relative advantage, "
+            "mean(|reward - group_mean|)). Extend via "
+            "`register_dynamic_allocation_metric`."
         )},
     )
     dynamic_allocation_metric_direction: Literal["higher", "lower"] = field(

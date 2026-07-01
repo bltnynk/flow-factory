@@ -28,7 +28,7 @@ trainers run the uniform `BaseTrainer.generate_samples` path byte-identically.
 |-------|---------|
 | `dynamic_allocation` | Master switch (default `False`). |
 | `dynamic_allocation_phase1_ratio` | `x` in `(0,1)`; `K1 = clamp(round(x*K), 2, K-1)`. |
-| `dynamic_allocation_metric` | Per-prompt metric registry key: `std` (default), `mean`. |
+| `dynamic_allocation_metric` | Per-prompt metric registry key: `std` (default), `mean`, `advantage` (mean absolute group-relative advantage `mean(\|r - group_mean\|)`). |
 | `dynamic_allocation_metric_direction` | `higher` (default) or `lower` — which metric value earns more phase-2 budget. |
 | `dynamic_allocation_strategy` | `proportional` (default) or `rank_linear`. |
 | `dynamic_allocation_min_per_prompt` | Min phase-2 (extra) rollouts guaranteed per prompt. |

@@ -77,7 +77,7 @@ train:
   # See .agents/knowledge/topics/dynamic_allocation.md.
   dynamic_allocation: true
   dynamic_allocation_phase1_ratio: 0.5            # x: phase 1 = round(x * group_size) rollouts/prompt (clamped to [2, K-1])
-  dynamic_allocation_metric: "std"                # Options: std (reward spread; recommended), mean. Extend via register_dynamic_allocation_metric.
+  dynamic_allocation_metric: "std"                # Options: std (reward spread; recommended), mean, advantage (mean |reward - group_mean|). Extend via register_dynamic_allocation_metric.
   dynamic_allocation_metric_direction: "higher"   # Options: higher, lower — which metric value earns more phase-2 budget
   dynamic_allocation_strategy: "proportional"     # Options: proportional, rank_linear
   dynamic_allocation_min_per_prompt: 0            # Minimum phase-2 (extra) rollouts guaranteed per prompt

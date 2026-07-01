@@ -140,6 +140,25 @@ def _metric_std(phase1_rewards: np.ndarray) -> float:
     return float(np.std(phase1_rewards))
 
 
+@register_dynamic_allocation_metric("advantage")
+def _metric_advantage(phase1_rewards: np.ndarray) -> float:
+    """Mean absolute group-relative advantage of a prompt's phase-1 rewards.
+
+    Computes the GRPO/NFT/AWM advantage *numerator* per rollout —
+    ``advantage_i = reward_i - mean(rewards)`` ("use the mean and the reward",
+    no std denominator) — then reduces to one per-prompt scalar as the mean
+    absolute advantage ``mean(|advantage_i|)``. (The plain mean of the
+    advantages is identically zero, so a magnitude reduction is required.)
+
+    Like ``std`` it grows with within-group reward spread — so prompts whose
+    phase-1 rollouts disagree most (the strongest, least-degenerate advantage
+    signal) rank highest and earn more phase-2 budget — but uses the L1
+    (mean-absolute) reduction instead of L2 (root-mean-square).
+    """
+    rewards = np.asarray(phase1_rewards, dtype=np.float64)
+    return float(np.mean(np.abs(rewards - rewards.mean())))
+
+
 # ======================== Allocation strategy registry ========================
 # A strategy maps a per-prompt metric vector to an integer extra-budget vector
 # that sums to ``total_extra`` (the phase-2 budget). ``direction`` is "higher"
