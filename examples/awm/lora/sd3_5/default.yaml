@@ -15,7 +15,7 @@ data:
         weight: 1  # Mixing weight (integer); ratio with other sources determines batch allocation
         max_dataset_size: null  # Cap on number of training samples for this source
       eval: {}  # Eval participation (inherits shared `eval:` section settings)
-  preprocessing_batch_size: 8  # Batch size for preprocessing
+  preprocessing_batch_size: 16  # Batch size for preprocessing
   dataloader_num_workers: 16  # Number of workers for DataLoader
   force_reprocess: false  # Force reprocessing of the dataset
   cache_dir: "/mnt/localssd/.cache/flow_factory/.cache/flow_factory/datasets" # Cache directory for preprocessed datasets
@@ -34,10 +34,10 @@ model:
   # attn_backend: '_flash_3_hub' # Attention backend for training.
 
 log:
-  run_name: awm_sd3_5_lora_default  # Run name (auto: {model_type}_{finetune_type}_{trainer_type}_{timestamp})
+  run_name: awm_default  # Run name (auto: {model_type}_{finetune_type}_{trainer_type}_{timestamp})
   project: "Flow-Factory"  # Project name for logging
   logging_backend: "wandb"  # Options: wandb, swanlab, none
-  save_dir: "/mnt/localssd/.cache/flow_factory/saves/"  # Directory to save model checkpoints and logs
+  save_dir: "saves/"  # Directory to save model checkpoints and logs
   save_freq: 10  # Save frequency in epochs (0 to disable)
   save_model_only: true  # Save only the model weights (not optimizer, scheduler, etc.)
   
@@ -76,7 +76,7 @@ train:
   guidance_scale: 1.0  # Guidance scale for sampling
 
   # Batch and sampling
-  per_device_batch_size: 8  # Batch size per device. For image-to-image task, this will always fallback to 1.
+  per_device_batch_size: 16  # Batch size per device. For image-to-image task, this will always fallback to 1.
   group_size: 16  # Group size for GRPO sampling
   global_std: true  # Use global std for advantage normalization
   unique_sample_num_per_epoch: 48  # Unique samples per group
@@ -103,7 +103,7 @@ scheduler:
 # Evaluation settings
 eval:
   resolution: 512  # Evaluation resolution
-  per_device_batch_size: 8  # Eval batch size
+  per_device_batch_size: 32  # Eval batch size
   guidance_scale: 1.0  # Guidance scale for sampling
   num_inference_steps: 40  # Number of eval timesteps
   eval_freq: 10  # Eval frequency in epochs (0 to disable)
@@ -113,7 +113,7 @@ eval:
 rewards:
   - name: "pick_score"
     reward_model: "PickScore"
-    batch_size: 16
+    batch_size: 32
     device: "cuda"
     dtype: bfloat16
 
