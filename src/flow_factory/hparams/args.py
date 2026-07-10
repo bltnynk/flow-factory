@@ -598,6 +598,18 @@ class Arguments(ArgABC):
             )
             self.data_args.sampler_type = "distributed_k_repeat"
 
+        # Pivot-advantage keeps each prompt's whole group (its N initial latents +
+        # the pivot) on one rank so the pivot latent and pivot-centered advantage
+        # are computed locally with no cross-rank communication. Force
+        # `group_contiguous`.
+        if getattr(ta, "pivot_advantage", False) and self.data_args.sampler_type != "group_contiguous":
+            logger.warning(
+                "pivot_advantage requires sampler_type='group_contiguous' "
+                f"(complete groups per rank). Overriding '{self.data_args.sampler_type}' "
+                "-> 'group_contiguous'."
+            )
+            self.data_args.sampler_type = "group_contiguous"
+
 
     def _align_batch_geometry(self) -> None:
         """Align ``unique_sample_num_per_epoch`` (and, for ``group_distributed``,

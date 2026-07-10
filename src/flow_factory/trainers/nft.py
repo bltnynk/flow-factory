@@ -33,6 +33,7 @@ tqdm = partial(tqdm_.tqdm, dynamic_ncols=True)
 
 from .abc import BaseTrainer
 from .dynamic_allocation import generate_samples_dynamicallocation
+from .pivot_advantage import generate_samples_pivotadvantage
 from ..hparams import NFTTrainingArguments
 from ..samples import BaseSample
 from ..rewards import RewardBuffer
@@ -194,6 +195,15 @@ class DiffusionNFTTrainer(BaseTrainer):
     # =========================== Sampling Loop ============================
     def sample(self) -> List[BaseSample]:
         """Generate rollouts for DiffusionNFT (final latents only)."""
+        if self.training_args.pivot_advantage:
+            # Generates N+1 per group, stores pivot-centered advantages on the N
+            # returned samples (drops the pivots). Advantage is finalized here, so
+            # prepare_feedback skips its own advantage computation.
+            return generate_samples_pivotadvantage(
+                self,
+                compute_log_prob=False,
+                trajectory_indices=[-1],
+            )
         if self.training_args.dynamic_allocation:
             return generate_samples_dynamicallocation(
                 self,
@@ -246,6 +256,10 @@ class DiffusionNFTTrainer(BaseTrainer):
 
     def prepare_feedback(self, samples: List[BaseSample]) -> None:
         """Finalize rewards, compute advantages, and log advantage metrics."""
+        if self.training_args.pivot_advantage:
+            # Pivot-centered advantages were already computed, stored on `samples`,
+            # and logged during sample(); nothing to do here.
+            return
         if self.training_args.dynamic_allocation:
             # Rewards were already computed per phase in sample(); reuse them
             # (aligned to `samples`) instead of re-running the reward models.

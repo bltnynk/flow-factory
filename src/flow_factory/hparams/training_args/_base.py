@@ -324,6 +324,24 @@ class TrainingArguments(ArgABC):
         )},
     )
 
+    # --- Pivot-advantage ---
+    # Per group of N, generate one extra "pivot" rollout whose initial latent is
+    # the (Gaussian-preserving) average of the N latents; center advantages on
+    # the pivot's reward instead of the group mean. Optimize on the N samples
+    # only. Default off -> baseline advantage. See
+    # trainers/pivot_advantage.py and topics/pivot_advantage.md.
+    pivot_advantage: bool = field(
+        default=False,
+        metadata={"help": (
+            "Enable pivot-advantage. For each prompt group of size N, roll out one "
+            "extra 'pivot' sample from the averaged initial latent "
+            "(sqrt(N) * mean, preserving N(0,I)), then normalize advantages as "
+            "(reward - pivot_reward) / std instead of (reward - group_mean) / std. "
+            "Training optimizes on the N samples only. v1: NFT + single source + "
+            "pointwise rewards; forces sampler_type=group_contiguous."
+        )},
+    )
+
     def __post_init__(self):
         # --- Resolution standardization ---
         if not self.resolution:
@@ -428,6 +446,26 @@ class TrainingArguments(ArgABC):
                     f"`dynamic_allocation` requires `group_size` >= 3 (got "
                     f"{self.group_size}): phase 1 needs >= 2 rollouts per prompt and "
                     "phase 2 needs a non-empty remaining budget."
+                )
+
+        # --- Pivot-advantage validation ---
+        if self.pivot_advantage:
+            if self.dynamic_allocation:
+                raise ValueError(
+                    "`pivot_advantage` and `dynamic_allocation` cannot be enabled "
+                    "together (they use different samplers and rollout paths). "
+                    "Enable one at a time."
+                )
+            if self.trainer_type.lower() != "nft":
+                raise ValueError(
+                    "`pivot_advantage` is currently wired for trainer_type='nft' "
+                    f"only, got '{self.trainer_type}'. AWM/GRPO support is planned."
+                )
+            if self.group_size < 2:
+                raise ValueError(
+                    f"`pivot_advantage` requires `group_size` >= 2 (got "
+                    f"{self.group_size}): the pivot latent is the average of the "
+                    "group's N initial latents."
                 )
 
     def compute_gradient_accumulation_steps(
