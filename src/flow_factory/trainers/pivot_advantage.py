@@ -26,13 +26,22 @@ rollout:
    (``mean`` of ``N`` i.i.d. standard normals has variance ``1/N``; ``* sqrt(N)``
    restores unit variance). Roll out all ``N + 1``.
 2. **Reward** — compute rewards for all ``N + 1`` samples as usual.
-3. **Advantage** — center on the pivot reward instead of the group mean::
+3. **Advantage** — center on the pivot reward instead of the group mean, with a
+   scale-up so the pivot is a self-consistent center. Per group (see
+   ``_pivot_numerators``), by the pivot's position relative to the group:
+   - ``pivot >= max``: no sample beats the pivot → advantage ``0`` for all (kept,
+     zero-gradient; dropping would break equal per-rank counts).
+   - ``pivot <= min``: every sample beats the pivot → advantage ``1`` for all.
+   - ``pivot > mean``: scale the above-pivot rewards up by
+     ``s = (N*pivot - sum(below)) / sum(above)`` so the transformed group mean
+     equals the pivot, then ``A_i = (r'_i - pivot) / std``.
+   - ``min < pivot <= mean``: no transform, ``A_i = (r_i - pivot) / std``.
 
-       A_i = (reward_i - reward_pivot) / std
-
-   The ``/ std`` scaling is kept (reusing ``global_std``) because NFT/AWM map the
-   advantage into ``[0, 1]`` via ``adv_clip_range``; an unscaled
-   ``reward_i - reward_pivot`` (~0.05 for PickScore) would collapse the signal.
+   ``std`` follows ``global_std``: the per-group std of the numerators when
+   ``False`` (now well-defined — for the transform case the pivot IS the mean),
+   or the global std of numerators when ``True``. The ``/ std`` scaling is kept
+   because NFT/AWM map the advantage into ``[0, 1]`` via ``adv_clip_range``; an
+   unscaled ``reward_i - reward_pivot`` (~0.05 for PickScore) would collapse it.
 4. **Optimize** — train on the ``N`` samples only (the pivot is a reference and
    is dropped), so the returned per-epoch sample count is ``M * N`` — identical
    geometry to uniform NFT (gradient accumulation unchanged).
@@ -242,21 +251,52 @@ def generate_samples_pivotadvantage(
             groups[p]["normal"].append(idx)
 
     normal_indices = [i for g in groups.values() for i in g["normal"]]
-    std = _resolve_std(accelerator, aggregated[normal_indices], ta.global_std)
 
-    returned: List[BaseSample] = []
+    # ----- Pass 1: per group, classify the pivot's position and form advantage
+    # numerators (scaling the above-pivot rewards up so the transformed group mean
+    # equals the pivot; see `_pivot_numerators`). -----
+    group_order = list(groups.keys())
+    group_mode: Dict[int, str] = {}
+    group_numer: Dict[int, np.ndarray] = {}  # numerators for 'transform'/'plain' groups
     pivot_rewards: List[float] = []
-    advantages: List[float] = []
-    for p, g in groups.items():
+    for p in group_order:
+        g = groups[p]
         if g["pivot"] is None:
             raise RuntimeError(f"pivot_advantage: prompt group {p} has no pivot sample.")
         reward_pivot = float(aggregated[g["pivot"]])
         pivot_rewards.append(reward_pivot)
-        group_std = std if ta.global_std else max(float(np.std(aggregated[g["normal"]])), 1e-6)
-        for i in g["normal"]:
-            adv = (float(aggregated[i]) - reward_pivot) / group_std
-            samples[i].extra_kwargs["advantage"] = torch.tensor(adv, device=device)
-            advantages.append(adv)
+        mode, numer = _pivot_numerators(aggregated[g["normal"]], reward_pivot)
+        group_mode[p] = mode
+        if numer is not None:
+            group_numer[p] = numer
+
+    # ----- Std of the advantage numerators: per-group (local) or global. -----
+    global_std_value = None
+    if ta.global_std:
+        pooled = (
+            np.concatenate([group_numer[p] for p in group_order if p in group_numer])
+            if group_numer
+            else np.zeros(0, dtype=np.float64)
+        )
+        global_std_value = _global_std_of(accelerator, pooled)
+
+    # ----- Pass 2: assign advantages. -----
+    returned: List[BaseSample] = []
+    advantages: List[float] = []
+    for p in group_order:
+        g = groups[p]
+        mode = group_mode[p]
+        if mode == "ignore":
+            adv_vals = np.zeros(len(g["normal"]), dtype=np.float64)
+        elif mode == "ones":
+            adv_vals = np.ones(len(g["normal"]), dtype=np.float64)
+        else:
+            numer = group_numer[p]
+            std_value = global_std_value if ta.global_std else max(float(np.std(numer)), 1e-6)
+            adv_vals = numer / std_value
+        for i, adv in zip(g["normal"], adv_vals):
+            samples[i].extra_kwargs["advantage"] = torch.tensor(float(adv), device=device)
+            advantages.append(float(adv))
             returned.append(samples[i])
 
     expected = groups_per_rank * group_size
@@ -267,28 +307,73 @@ def generate_samples_pivotadvantage(
             "the optimize loop's gradient accumulation."
         )
 
+    mode_counts = {
+        m: sum(v == m for v in group_mode.values())
+        for m in ("transform", "plain", "ones", "ignore")
+    }
     _log_pivot_advantage(
-        trainer, aggregated[normal_indices], np.asarray(pivot_rewards), np.asarray(advantages)
+        trainer,
+        aggregated[normal_indices],
+        np.asarray(pivot_rewards),
+        np.asarray(advantages),
+        mode_counts,
     )
     return returned
 
 
-def _resolve_std(accelerator, normal_rewards: np.ndarray, global_std: bool) -> float:
-    """Global std over all normal-sample rewards (all-reduced) when ``global_std``.
+def _pivot_numerators(rewards: np.ndarray, reward_pivot: float):
+    """Classify the pivot's position in the group and form advantage numerators.
 
-    Returns the scalar global std when ``global_std`` is True; otherwise returns
-    ``0.0`` (unused — the caller computes a per-group std instead).
+    Returns ``(mode, numerators)``:
+
+    - ``'ignore'`` — ``pivot >= max(rewards)``: no sample beats the pivot (every
+      advantage would be <= 0). ``numerators=None`` → advantage 0 (kept for equal
+      per-rank counts, but contributes no gradient).
+    - ``'ones'`` — ``pivot <= min(rewards)``: every sample beats the pivot.
+      ``numerators=None`` → advantage 1.
+    - ``'transform'`` — ``pivot > mean``: scale the above-pivot rewards up by
+      ``s = (N*pivot - sum(below)) / sum(above)`` so the transformed group mean
+      equals the pivot; ``numerators = r' - pivot`` (zero-mean by construction).
+    - ``'plain'`` — ``min < pivot <= mean``: no transform; ``numerators = r - pivot``.
+
+    Args:
+        rewards: The group's ``N`` normal-sample (aggregated) rewards.
+        reward_pivot: The group's pivot-sample reward.
+
+    Returns:
+        ``(mode, numerators)`` where ``numerators`` is an ``(N,)`` array for
+        ``'transform'``/``'plain'`` and ``None`` for ``'ignore'``/``'ones'``.
     """
-    if not global_std:
-        return 0.0
-    r = np.asarray(normal_rewards, dtype=np.float64)
+    r = np.asarray(rewards, dtype=np.float64)
+    n = len(r)
+    if reward_pivot >= float(r.max()):
+        return "ignore", None
+    if reward_pivot <= float(r.min()):
+        return "ones", None
+    if reward_pivot > float(r.mean()):
+        above = r > reward_pivot
+        sum_above = float(r[above].sum())
+        if sum_above <= 1e-12:  # safety: cannot scale positive mass up
+            return "plain", r - reward_pivot
+        s = (n * reward_pivot - float(r[~above].sum())) / sum_above
+        r_transformed = r.copy()
+        r_transformed[above] = r[above] * s
+        return "transform", r_transformed - reward_pivot
+    return "plain", r - reward_pivot
+
+
+def _global_std_of(accelerator, values: np.ndarray) -> float:
+    """Global std of *values* across ranks via a single (count, sum, sum_sq) all-reduce."""
+    v = np.asarray(values, dtype=np.float64)
     t = torch.tensor(
-        [float(len(r)), float(r.sum()), float((r**2).sum())],
+        [float(len(v)), float(v.sum()), float((v**2).sum())],
         device=accelerator.device,
         dtype=torch.float64,
     )
     t = accelerator.reduce(t, reduction="sum")
     n, s, ss = t[0].item(), t[1].item(), t[2].item()
+    if n <= 0:
+        return 1e-6
     return max((ss / n - (s / n) ** 2) ** 0.5, 1e-6)
 
 
@@ -297,11 +382,14 @@ def _log_pivot_advantage(
     normal_rewards: np.ndarray,
     pivot_rewards: np.ndarray,
     advantages: np.ndarray,
+    mode_counts: Dict[str, int],
 ) -> None:
-    """Log global reward / pivot / advantage stats (main process).
+    """Log global reward / pivot / advantage stats + per-group mode mix (main process).
 
-    ``pivot_adv_frac_positive`` is the key diagnostic: unlike mean-centered
-    advantage (~0.5), it reports how often a sample beats its group's pivot.
+    ``pivot_adv_frac_positive`` reports how often a sample beats its group's pivot.
+    ``pivot_group_frac_{transform,plain,ones,ignore}`` reports how the groups split
+    across the pivot-position cases (see :func:`_pivot_numerators`) — e.g. a high
+    ``ignore`` fraction means the pivot often lands above the whole group.
     """
     accelerator = trainer.accelerator
 
@@ -309,23 +397,34 @@ def _log_pivot_advantage(
         t = torch.as_tensor(arr, dtype=torch.float32, device=accelerator.device)
         return accelerator.gather(t).cpu().numpy()
 
+    modes = ("transform", "plain", "ones", "ignore")
+    counts = (
+        accelerator.reduce(
+            torch.tensor([float(mode_counts[m]) for m in modes], device=accelerator.device),
+            reduction="sum",
+        )
+        .cpu()
+        .numpy()
+    )
+    total_groups = max(float(counts.sum()), 1.0)
+
     g_reward = _gather(normal_rewards)
     g_pivot = _gather(pivot_rewards)
     g_adv = _gather(advantages)
 
     if not accelerator.is_main_process:
         return
-    trainer.log_data(
-        {
-            "train/reward_mean": float(np.mean(g_reward)),
-            "train/reward_std": float(np.std(g_reward)),
-            "train/pivot_reward_mean": float(np.mean(g_pivot)),
-            "train/pivot_reward_std": float(np.std(g_pivot)),
-            "train/pivot_adv_mean": float(np.mean(g_adv)),
-            "train/pivot_adv_abs_mean": float(np.mean(np.abs(g_adv))),
-            "train/pivot_adv_min": float(np.min(g_adv)),
-            "train/pivot_adv_max": float(np.max(g_adv)),
-            "train/pivot_adv_frac_positive": float(np.mean(g_adv > 0)),
-        },
-        step=trainer.step,
-    )
+    log_data = {
+        "train/reward_mean": float(np.mean(g_reward)),
+        "train/reward_std": float(np.std(g_reward)),
+        "train/pivot_reward_mean": float(np.mean(g_pivot)),
+        "train/pivot_reward_std": float(np.std(g_pivot)),
+        "train/pivot_adv_mean": float(np.mean(g_adv)),
+        "train/pivot_adv_abs_mean": float(np.mean(np.abs(g_adv))),
+        "train/pivot_adv_min": float(np.min(g_adv)),
+        "train/pivot_adv_max": float(np.max(g_adv)),
+        "train/pivot_adv_frac_positive": float(np.mean(g_adv > 0)),
+    }
+    for m, c in zip(modes, counts):
+        log_data[f"train/pivot_group_frac_{m}"] = float(c) / total_groups
+    trainer.log_data(log_data, step=trainer.step)

@@ -1,0 +1,148 @@
+# DiffusionNFT on GenEval: compositional T2I (counting/color/position/exclusion) via LoRA on SD3.5-M.
+# Based on nft/lora/sd3_5/default.yaml (PickScore) with dataset/rewards swapped to GenEval.
+# Environment Configuration
+launcher: "accelerate"  # Options: accelerate
+config_file: config/deepspeed/deepspeed_zero2.yaml  # Path to distributed config file (optional)
+num_processes: 8  # Number of processes to launch (overrides config file)
+main_process_port: 29500
+mixed_precision: "bf16"  # Options: no, fp16, bf16
+
+# Data Configuration
+data:
+  datasets:
+    - name: geneval  # Unique identifier (used in metrics, caching, reward routing)
+      dataset_dir: "dataset/geneval"  # Folder with train.jsonl / test.jsonl
+      train:  # Training participation config
+        weight: 1  # Mixing weight (integer); ratio with other sources determines batch allocation
+        max_dataset_size: null  # Cap on number of training samples for this source
+      eval: {}  # Eval participation (inherits shared `eval:` section settings)
+  preprocessing_batch_size: 32  # Batch size for preprocessing
+  dataloader_num_workers: 16  # Number of workers for DataLoader
+  force_reprocess: false  # Force reprocessing of the dataset
+  cache_dir: "/mnt/localssd/.cache/flow_factory/datasets" # Cache directory for preprocessed datasets
+  sampler_type: "auto"  # Options: auto, distributed_k_repeat, group_contiguous
+
+# Model Configuration
+model:
+  finetune_type: 'lora' # Options: full, lora
+  lora_rank : 32
+  lora_alpha : 64
+  target_modules: "default" # Options: all, default, or list of module names like ["to_k", "to_q", "to_v", "to_out.0"]
+  model_name_or_path: "stabilityai/stable-diffusion-3.5-medium"
+  model_type: "sd3-5"
+  resume_path: null # Local path or HF repo id (e.g. 'owner/repo[/subdir][@rev]') for previous checkpoint/lora adapter
+  resume_type: null # Options: lora, full, state. Null to auto-detect based on `finetune_type`
+  # attn_backend: '_flash_3_hub' # Attention backend for training.
+
+# --- Dynamic (adaptive) rollout allocation ---
+  # Two-phase rollout that redistributes the FIXED epoch budget
+  # (unique_sample_num_per_epoch * group_size) across prompts by a phase-1
+  # metric: phase 1 rolls out a fraction of each prompt's budget and scores it,
+  # then phase 2 gives more budget to higher-ranked prompts. Total images/epoch
+  # is unchanged vs. the uniform baseline; only per-prompt counts change.
+  # v1: single training source + pointwise rewards only.
+  # See .agents/knowledge/topics/dynamic_allocation.md.
+  dynamic_allocation: true
+  dynamic_allocation_phase1_ratio: 0.5            # x: phase 1 = round(x * group_size) rollouts/prompt (clamped to [2, K-1])
+  dynamic_allocation_metric: "advantage"                # Options: std (reward spread; recommended), mean. Extend via register_dynamic_allocation_metric.
+  dynamic_allocation_metric_direction: "lower"   # Options: higher, lower — which metric value earns more phase-2 budget
+  dynamic_allocation_strategy: "rank_linear"     # Options: proportional, rank_linear
+  dynamic_allocation_min_per_prompt: 0            # Minimum phase-2 (extra) rollouts guaranteed per prompt
+
+log:
+  run_name: nft_geneval_dynamic_advlower  # Run name (auto: {model_type}_{finetune_type}_{timestamp})
+  project: "Flow-Factory"  # Project name for logging
+  logging_backend: "wandb"  # Options: wandb, swanlab, none
+  save_dir: "saves/"  # Directory to save model checkpoints and logs
+  save_freq: 20  # Save frequency in epochs (0 to disable)
+  save_model_only: true  # Save only the model weights (not optimizer, scheduler, etc.)
+
+# Training Configuration
+train:
+  # Trainer settings
+  trainer_type: 'nft'
+  advantage_aggregation: 'sum' # Options: 'sum', 'gdpo'
+  nft_beta: 0.1
+  # `Old` Policy settings
+  off_policy: true # Whether to use ema parameters for sampling off-policy data.
+  ema_decay_schedule: "piecewise_linear"  # Decay schedule for EMA. Options: ['constant', 'power', 'linear', 'piecewise_linear', 'cosine', 'warmup_cosine']
+  flat_steps: 0
+  ramp_rate: 0.001
+  ema_decay: 0.5  # EMA decay rate (0 to disable)
+  ema_update_interval: 1  # EMA update interval (in epochs)
+  ema_device: "cuda"  # Device to store EMA model (options: cpu, cuda)
+  # Training Timestep distribution
+  num_train_timesteps: 4 # Set null to all steps
+  time_sampling_strategy: discrete # Options: uniform, logit_normal, discrete, discrete_with_init, discrete_wo_init
+  time_shift: 3.0
+  timestep_range: 0.5 # Select fraction of timesteps to train on
+  # KL div
+  kl_type: 'v-based'
+  kl_beta: 0 # KL divergence beta, 0 to disable
+  ref_param_device: 'cuda' # Options: cpu, cuda
+  # Clipping
+  adv_clip_range: 5.0  # Advantage clipping range
+
+  # Sampling Settings
+  resolution: 512  # Can be int or [height, width]
+  num_inference_steps: 10  # Number of timesteps
+  guidance_scale: 1.0  # Guidance scale for sampling
+
+  # Batch and sampling
+  per_device_batch_size: 16  # Batch size per device. For image-to-image task, this will always fallback to 1.
+  group_size: 16  # Group size for GRPO sampling
+  global_std: false  # Use global std for advantage normalization
+  unique_sample_num_per_epoch: 48  # Unique samples per group
+  gradient_step_per_epoch: 1  # Gradient steps per epoch
+  gradient_accumulation_steps: auto  # Options: auto, or positive integer. When set, `gradient_step_per_epoch` is ignored.
+
+  # Optimization
+  learning_rate: 3.0e-4  # Initial learning rate
+  adam_weight_decay: 1.0e-4  # AdamW weight decay
+  adam_betas: [0.9, 0.999]  # AdamW betas
+  adam_epsilon: 1.0e-8  # AdamW epsilon
+  max_grad_norm: 1.0  # Max gradient norm for clipping
+
+  # Gradient Checkpointing
+  enable_gradient_checkpointing: false  # Enable gradient checkpointing to save memory with extra compute
+
+  # Seed
+  seed: 42 # Random seed
+
+# Scheduler Configuration
+scheduler:
+  dynamics_type: "ODE"  # Options: Flow-SDE, Dance-SDE, CPS, ODE. NFT is decoupled, so ODE is valid (and cheapest) here.
+
+# Evaluation settings
+eval:
+  resolution: 512  # Evaluation resolution
+  per_device_batch_size: 16  # Eval batch size
+  guidance_scale: 1.0  # Guidance scale for sampling (GenEval prompts benefit from CFG at eval time)
+  num_inference_steps: 40  # Number of eval timesteps
+  eval_freq: 20  # Eval frequency in epochs (0 to disable)
+  seed: 42  # Eval seed (defaults to training seed)
+
+# Reward Model Configuration
+# GenEval uses Mask2Former (mmdet 3.x) + CLIP for compositional evaluation.
+# Returns continuous reward in [0, 1] based on object count/color/position accuracy.
+# Requires: bash scripts/install_geneval_deps.sh (mmcv/mmdet, Python 3.10)
+rewards:
+  - name: "geneval"
+    reward_model: "geneval"
+    batch_size: 32
+    device: "cuda"
+    dtype: bfloat16
+    # Optional overrides (defaults work out of the box with mmdet model zoo):
+    # detector_config: "mask2former_swin-s-p4-w7-224_8xb2-lsj-50e_coco"
+    # detector_checkpoint: "https://download.openmmlab.com/..."  # auto-downloaded
+    # clip_model: "ViT-L-14"
+    # detection_threshold: 0.3
+    # counting_threshold: 0.9
+
+# Optional Evaluation Reward Models
+eval_rewards:
+  - name: "geneval"
+    reward_model: "geneval"
+    batch_size: 32
+    device: "cuda"
+    dtype: bfloat16
