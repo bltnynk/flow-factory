@@ -183,7 +183,6 @@ class SD3_5Adapter(BaseAdapter):
         num_inference_steps: Optional[int] = 50,
         guidance_scale: float = 7.5,
         generator: Optional[torch.Generator] = None,
-        latents: Optional[torch.Tensor] = None,
         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
         # Encoded Prompt
         prompt_ids : Optional[torch.Tensor] = None,
@@ -240,12 +239,6 @@ class SD3_5Adapter(BaseAdapter):
         num_channels_latents = self.pipeline.transformer.config.in_channels
 
         # 3. Prepare latent variables
-        # When `latents` is provided it is used verbatim as the initial noise
-        # (diffusers `prepare_latents` returns it as-is, only moved to
-        # device/dtype); otherwise fresh noise is sampled from `generator`.
-        # The injection path is used by pivot-advantage sampling
-        # (trainers/pivot_advantage.py) to roll out from a specific initial
-        # latent (the per-group averaged "pivot" latent).
         latents = self.pipeline.prepare_latents(
             batch_size,
             num_channels_latents,
@@ -254,7 +247,6 @@ class SD3_5Adapter(BaseAdapter):
             dtype,
             device,
             generator,
-            latents,
         )
         # latents : torch.Tensor of shape (B, C, H/8, W/8), not packed
 
