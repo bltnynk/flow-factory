@@ -15,12 +15,12 @@ data:
       dataset_dir: "dataset/pickscore"  # Folder with train.jsonl / test.jsonl
       train:  # Training participation config
         weight: 1  # Mixing weight (integer); ratio with other sources determines batch allocation
-        max_dataset_size: 1024  # Cap on number of training samples for this source
+        max_dataset_size: null  # Cap on number of training samples for this source
       eval: {}  # Eval participation (inherits shared `eval:` section settings)
   preprocessing_batch_size: 8  # Batch size for preprocessing
   dataloader_num_workers: 16  # Number of workers for DataLoader
   force_reprocess: false  # Force reprocessing of the dataset
-  cache_dir: "~/.cache/flow_factory/datasets" # Cache directory for preprocessed datasets
+  cache_dir: "/mnt/localssd/.cache/flow_factory/datasets" # Cache directory for preprocessed datasets
   sampler_type: "distributed_k_repeat"  # Required by dynamic_allocation (cross-rank gather); "auto" is force-overridden to this.
 
 # Model Configuration
@@ -36,7 +36,7 @@ model:
   # attn_backend: '_flash_3_hub' # Attention backend for training.
 
 log:
-  run_name: null  # Run name (auto: {model_type}_{finetune_type}_{trainer_type}_{timestamp})
+  run_name: flowgrpo_dynamic_default  # Run name (auto: {model_type}_{finetune_type}_{trainer_type}_{timestamp})
   project: "Flow-Factory"  # Project name for logging
   logging_backend: "wandb"  # Options: wandb, swanlab, tensorboard, none
   save_dir: "saves/"  # Directory to save model checkpoints and logs
@@ -77,9 +77,9 @@ train:
   # See .agents/knowledge/topics/dynamic_allocation.md.
   dynamic_allocation: true
   dynamic_allocation_phase1_ratio: 0.5            # x: phase 1 = round(x * group_size) rollouts/prompt (clamped to [2, K-1])
-  dynamic_allocation_metric: "std"                # Options: std (reward spread; recommended), mean, advantage (mean |reward - group_mean|). Extend via register_dynamic_allocation_metric.
+  dynamic_allocation_metric: "advantage"                # Options: std (reward spread; recommended), mean, advantage (mean |reward - group_mean|). Extend via register_dynamic_allocation_metric.
   dynamic_allocation_metric_direction: "higher"   # Options: higher, lower — which metric value earns more phase-2 budget
-  dynamic_allocation_strategy: "proportional"     # Options: proportional, rank_linear
+  dynamic_allocation_strategy: "rank_linear"     # Options: proportional, rank_linear
   dynamic_allocation_min_per_prompt: 0            # Minimum phase-2 (extra) rollouts guaranteed per prompt
   gradient_step_per_epoch: 2  # Gradient steps per epoch
   gradient_accumulation_steps: auto  # Options: auto, or positive integer. When set, `gradient_step_per_epoch` is ignored.
@@ -113,7 +113,7 @@ scheduler:
 # Evaluation settings
 eval:
   resolution: 512  # Evaluation resolution
-  per_device_batch_size: 8  # Eval batch size
+  per_device_batch_size: 32  # Eval batch size
   guidance_scale: 4.5  # Guidance scale for sampling
   num_inference_steps: 40  # Number of eval timesteps
   eval_freq: 20  # Eval frequency in epochs (0 to disable)
@@ -123,7 +123,7 @@ eval:
 rewards:
   - name: "pick_score"
     reward_model: "PickScore"
-    batch_size: 16
+    batch_size: 32
     device: "cuda"
     dtype: bfloat16
 

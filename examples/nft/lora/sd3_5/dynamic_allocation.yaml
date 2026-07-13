@@ -15,7 +15,7 @@ data:
         weight: 1  # Mixing weight (integer); ratio with other sources determines batch allocation
         max_dataset_size: null  # Cap on number of training samples for this source
       eval: {}  # Eval participation (inherits shared `eval:` section settings)
-  preprocessing_batch_size: 16  # Batch size for preprocessing
+  preprocessing_batch_size: 32  # Batch size for preprocessing
   dataloader_num_workers: 16  # Number of workers for DataLoader
   force_reprocess: false  # Force reprocessing of the dataset
   cache_dir: "/mnt/localssd/.cache/flow_factory/datasets" # Cache directory for preprocessed datasets
@@ -34,11 +34,11 @@ model:
   # attn_backend: '_flash_3_hub' # Attention backend for training.
 
 log:
-  run_name: nft_group4_dynamic_linear_adv_lower  # Run name (auto: {model_type}_{finetune_type}_{timestamp})
+  run_name: nft_dynamic_linear_advhigher_10step_lr3.0e-4_phase1_0.25  # Run name (auto: {model_type}_{finetune_type}_{timestamp})
   project: "Flow-Factory"  # Project name for logging
   logging_backend: "wandb"  # Options: wandb, swanlab, none
   save_dir: "saves"  # Directory to save model checkpoints and logs
-  save_freq: 10  # Save frequency in epochs (0 to disable)
+  save_freq: 20  # Save frequency in epochs (0 to disable)
   save_model_only: true  # Save only the model weights (not optimizer, scheduler, etc.)
   
 # Training Configuration
@@ -69,12 +69,12 @@ train:
 
   # Sampling Settings
   resolution: 512  # Can be int or [height, width]
-  num_inference_steps: 14  # Number of timesteps
+  num_inference_steps: 10  # Number of timesteps
   guidance_scale: 1.0  # Guidance scale for sampling
 
   # Batch and sampling
-  per_device_batch_size: 8  # Batch size per device. For image-to-image task, this will always fallback to 1.
-  group_size: 4  # Group size for GRPO sampling
+  per_device_batch_size: 16  # Batch size per device. For image-to-image task, this will always fallback to 1.
+  group_size: 16  # Group size for GRPO sampling
   global_std: false  # Use global std for advantage normalization
   unique_sample_num_per_epoch: 48  # Unique samples per group
 
@@ -87,16 +87,16 @@ train:
   # v1: single training source + pointwise rewards only.
   # See .agents/knowledge/topics/dynamic_allocation.md.
   dynamic_allocation: true
-  dynamic_allocation_phase1_ratio: 0.5            # x: phase 1 = round(x * group_size) rollouts/prompt (clamped to [2, K-1])
+  dynamic_allocation_phase1_ratio: 0.25            # x: phase 1 = round(x * group_size) rollouts/prompt (clamped to [2, K-1])
   dynamic_allocation_metric: "advantage"                # Options: std (reward spread; recommended), mean. Extend via register_dynamic_allocation_metric.
-  dynamic_allocation_metric_direction: "lower"   # Options: higher, lower — which metric value earns more phase-2 budget
+  dynamic_allocation_metric_direction: "higher"   # Options: higher, lower — which metric value earns more phase-2 budget
   dynamic_allocation_strategy: "rank_linear"     # Options: proportional, rank_linear
   dynamic_allocation_min_per_prompt: 0            # Minimum phase-2 (extra) rollouts guaranteed per prompt
   gradient_step_per_epoch: 1  # Gradient steps per epoch
   gradient_accumulation_steps: auto  # Options: auto, or positive integer. When set, `gradient_step_per_epoch` is ignored.
   
   # Optimization
-  learning_rate: 1.0e-4  # Initial learning rate
+  learning_rate: 3.0e-4  # Initial learning rate
   adam_weight_decay: 1.0e-4  # AdamW weight decay
   adam_betas: [0.9, 0.999]  # AdamW betas
   adam_epsilon: 1.0e-8  # AdamW epsilon
@@ -115,10 +115,10 @@ scheduler:
 # Evaluation settings
 eval:
   resolution: 512  # Evaluation resolution
-  per_device_batch_size: 16  # Eval batch size
+  per_device_batch_size: 32  # Eval batch size
   guidance_scale: 1.0  # Guidance scale for sampling
   num_inference_steps: 40  # Number of eval timesteps
-  eval_freq: 10  # Eval frequency in epochs (0 to disable)
+  eval_freq: 20  # Eval frequency in epochs (0 to disable)
   seed: 42  # Eval seed (defaults to training seed)
 
 # Reward Model Configuration

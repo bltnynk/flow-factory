@@ -38,7 +38,7 @@ log:
   project: "Flow-Factory"  # Project name for logging
   logging_backend: "wandb"  # Options: wandb, swanlab, none
   save_dir: "saves/"  # Directory to save model checkpoints and logs
-  save_freq: 10  # Save frequency in epochs (0 to disable)
+  save_freq: 20  # Save frequency in epochs (0 to disable)
   save_model_only: true  # Save only the model weights (not optimizer, scheduler, etc.)
   
 # Training Configuration
@@ -50,7 +50,7 @@ train:
   awm_weighting: 'ghuber'
   ghuber_power: 0.25
   # Training Timestep distribution
-  num_train_timesteps: 6 # Set null to all steps
+  num_train_timesteps: 4 # Set null to all steps
   time_sampling_strategy: discrete_wo_init # Options: uniform, logit_normal, discrete, discrete_with_init, discrete_wo_init
   time_shift: 3.0
   timestep_range: 0.9
@@ -72,7 +72,7 @@ train:
 
   # Sampling Settings
   resolution: 512  # Can be int or [height, width]
-  num_inference_steps: 14  # Number of timesteps
+  num_inference_steps: 10  # Number of timesteps
   guidance_scale: 1.0  # Guidance scale for sampling
 
   # Batch and sampling
@@ -106,7 +106,7 @@ eval:
   per_device_batch_size: 32  # Eval batch size
   guidance_scale: 1.0  # Guidance scale for sampling
   num_inference_steps: 40  # Number of eval timesteps
-  eval_freq: 10  # Eval frequency in epochs (0 to disable)
+  eval_freq: 20  # Eval frequency in epochs (0 to disable)
   seed: 42  # Eval seed (defaults to training seed)
 
 # Reward Model Configuration
